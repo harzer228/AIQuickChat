@@ -36,3 +36,15 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 # Qt GUI code uses lambdas for signal wiring by design
 "ui/*" = ["E731"]
+
+[tool.ruff.lint.isort]
+# Explicit first-party classification: without it ruff guesses from folder
+# names, and on Windows a local Vosk/ model folder makes it treat the
+# third-party `import vosk` as first-party (case-insensitive match),
+# demanding a different import layout than on CI.
+known-first-party = [
+    "api", "ui", "utils", "stt", "local_websearch", "config", "main",
+]
+# ...and pin the speech stack to third-party so results are identical
+# with or without a local Vosk model folder.
+known-third-party = ["vosk", "sounddevice"]
