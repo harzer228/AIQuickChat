@@ -1,6 +1,6 @@
 # AI Quick Chat
 
-![CI](https://github.com/<USERNAME>/AIQuickChat/actions/workflows/ci.yml/badge.svg)
+![CI](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml/badge.svg)
 
 Быстрый **desktop AI-ассистент для Windows**. Вызывается глобальной горячей
 клавишей (`Ctrl+Space` по умолчанию) поверх любого приложения — браузера,
