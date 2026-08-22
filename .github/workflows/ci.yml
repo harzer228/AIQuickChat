@@ -32,7 +32,7 @@ jobs:
         run: ruff check .
 
       - name: Tests (pytest + coverage)
-        run: pytest --cov --cov-report=term
+        run: python -m pytest --cov --cov-report=term
 
       - name: Upload coverage artifact
         if: matrix.python-version == '3.12'

@@ -7,6 +7,9 @@
 testpaths = ["tests"]
 addopts = "-q"
 qt_api = "pyside6"
+# Make project packages (api/, ui/, utils/...) importable regardless of how
+# pytest is invoked (direct executable vs `python -m pytest`).
+pythonpath = ["."]
 
 [tool.coverage.run]
 source = ["api", "ui", "utils", "stt", "local_websearch"]
