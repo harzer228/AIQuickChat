@@ -17,7 +17,6 @@ from utils.i18n import t
 
 try:
     import sounddevice as sd
-
     import vosk
     SOUNDDEVICE_OK = True
 except Exception:  # pragma: no cover - protects the whole app from a broken install
