@@ -126,3 +126,28 @@ def test_hotkey_new_tab_setting_respected(chat_window):
     before = chat_window.tabs_widget.count()
     chat_window.start_new_chat()  # what toggle_chat calls when the setting is on
     assert chat_window.tabs_widget.count() == before + 1
+
+
+def test_rapid_toggle_does_not_shrink_window(chat_window, monkeypatch):
+    """Interrupting open/hide animations must not compound into a shrink."""
+    from PySide6.QtCore import QEventLoop, QTimer
+
+    def pump(ms):
+        loop = QEventLoop()
+        QTimer.singleShot(ms, loop.quit)
+        loop.exec()
+
+    chat_window.show_animated()
+    pump(400)
+    width, height = chat_window.width(), chat_window.height()
+
+    for _ in range(20):
+        chat_window.show_animated()
+        pump(40)   # mid-animation (open runs 170 ms)
+        chat_window.hide_animated()
+        pump(40)   # mid-animation (hide runs 130 ms)
+    chat_window.show_animated()
+    pump(400)
+
+    assert abs(chat_window.width() - width) <= 1
+    assert abs(chat_window.height() - height) <= 1
