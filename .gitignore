@@ -1,0 +1,43 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# --- Secrets / environment ---
+.env
+.env.*
+
+# --- IDE / editors ---
+.idea/
+.vscode/
+*.swp
+*~
+
+# --- OS ---
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# --- Project artifacts ---
+# Vosk speech models are large binaries — download separately (see README)
+Vosk/
+*.log

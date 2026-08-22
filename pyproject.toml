@@ -1,0 +1,35 @@
+# Tool configuration for the AIQuickChat desktop application.
+# NOTE: this is an application, not a distributable library — there is
+# intentionally no [build-system]/[project] packaging section. Build with
+# PyInstaller (AIQuickChat.spec).
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+qt_api = "pyside6"
+
+[tool.coverage.run]
+source = ["api", "ui", "utils", "stt", "local_websearch"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "except Exception:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "build", "dist", "Vosk"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = [
+    "E501",  # long lines allowed (rich QSS strings / docstrings)
+    "UP015", # explicit open() modes are fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Qt GUI code uses lambdas for signal wiring by design
+"ui/*" = ["E731"]
