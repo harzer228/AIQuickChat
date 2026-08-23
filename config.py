@@ -20,6 +20,14 @@ DEFAULT_STT_SILENCE_TIMEOUT = 1.5
 DEFAULT_STT_SAMPLE_RATE = 16000
 DEFAULT_STT_HOTKEY = "Ctrl+Shift+Space"
 
+# Chat window size limits
+DEFAULT_WINDOW_WIDTH = 470
+DEFAULT_WINDOW_HEIGHT = 640
+WINDOW_MIN_WIDTH = 420
+WINDOW_MAX_WIDTH = 900
+WINDOW_MIN_HEIGHT = 500
+WINDOW_MAX_HEIGHT = 1400
+
 # Credential Manager targets
 CRED_TARGET_DEEPSEEK = f"{APP_NAME}/deepseek-key"
 CRED_TARGET_VISION = f"{APP_NAME}/cloudflare-token"
@@ -101,7 +109,7 @@ DEFAULT_CONFIG = {
         "open_new_tab_on_hotkey": True,
     },
     "window": {
-        "width": 470,
-        "height": 640,
+        "width": DEFAULT_WINDOW_WIDTH,
+        "height": DEFAULT_WINDOW_HEIGHT,
     },
 }
