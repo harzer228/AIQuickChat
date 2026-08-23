@@ -154,6 +154,9 @@ class ChatWindow(QWidget):
         self._worker = None
         self._task_tab = None
         self._anim = None
+        self._geo_anim = None        # in-flight open/hide scale animation
+        self._geo_anim_lock = False  # True while setGeometry() prepares an animation
+        self._rest_geo = None        # full-size geometry, never shrunk by animations
         self._quitting = False
         self._pending_sources = None
         self._cancel_event = None
@@ -1647,49 +1650,86 @@ class ChatWindow(QWidget):
 
     def hide_animated(self):
         if self._animations_enabled() and self.isVisible():
-            target = self.geometry()
-            center = target.center()
-            end_w = int(target.width() * 0.96)
-            end_h = int(target.height() * 0.96)
+            resting = self._resting_geometry()
+            center = resting.center()
+            end_w = int(resting.width() * 0.96)
+            end_h = int(resting.height() * 0.96)
             end_geo = QRect(center.x() - end_w // 2, center.y() - end_h // 2, end_w, end_h)
-            anim_geo = QPropertyAnimation(self, b"geometry", self)
-            anim_geo.setDuration(130)
-            anim_geo.setStartValue(target)
-            anim_geo.setEndValue(end_geo)
-            anim_geo.setEasingCurve(QEasingCurve.InCubic)
+            self._scale_to(resting, end_geo, 130)
+            if self._anim is not None:
+                self._anim.stop()
             anim_op = QPropertyAnimation(self, b"windowOpacity", self)
             anim_op.setDuration(130)
             anim_op.setStartValue(self.windowOpacity())
             anim_op.setEndValue(0.0)
             anim_op.setEasingCurve(QEasingCurve.InCubic)
             anim_op.finished.connect(self.hide)
-            anim_geo.start()
             anim_op.start()
             self._anim = anim_op
         else:
             self.hide()
 
     def _animate_open(self):
-        """Opacity 0 -> 1 with a gentle 0.96 -> 1 scale, anchored to the center."""
-        target = self.geometry()
+        """Opacity 0 -> 1 with a gentle 0.96 -> 1 scale, anchored to the center.
+
+        Both geometry keyframes derive from the resting (full-size) geometry,
+        so rapid open/hide toggling can never compound into a shrink.
+        """
+        target = self._resting_geometry()
         center = target.center()
         start_w = int(target.width() * 0.96)
         start_h = int(target.height() * 0.96)
         start_geo = QRect(center.x() - start_w // 2, center.y() - start_h // 2, start_w, start_h)
-        self.setGeometry(start_geo)
-        anim_geo = QPropertyAnimation(self, b"geometry", self)
-        anim_geo.setDuration(170)
-        anim_geo.setStartValue(start_geo)
-        anim_geo.setEndValue(target)
-        anim_geo.setEasingCurve(QEasingCurve.OutCubic)
+        self._scale_to(start_geo, target, 170)
+        if self._anim is not None:
+            self._anim.stop()
         anim_op = QPropertyAnimation(self, b"windowOpacity", self)
         anim_op.setDuration(170)
         anim_op.setStartValue(0.0)
         anim_op.setEndValue(self._target_opacity())
         anim_op.setEasingCurve(QEasingCurve.OutCubic)
-        anim_geo.start()
         anim_op.start()
         self._anim = anim_op
+
+    # ------------------------------------------------------- scale animations
+
+    def _resting_geometry(self) -> QRect:
+        """The window's true full-size geometry, ignoring any scale animation."""
+        return self._rest_geo if self._rest_geo is not None else self.geometry()
+
+    def _geo_anim_active(self) -> bool:
+        return (self._geo_anim_lock
+                or (self._geo_anim is not None
+                    and self._geo_anim.state() == QPropertyAnimation.Running))
+
+    def _scale_to(self, start_geo: QRect, end_geo: QRect, duration: int):
+        """Animate the window geometry; replaces any animation in flight."""
+        if self._geo_anim is not None:
+            self._geo_anim.stop()
+        anim = QPropertyAnimation(self, b"geometry", self)
+        anim.setDuration(duration)
+        anim.setStartValue(start_geo)
+        anim.setEndValue(end_geo)
+        anim.setEasingCurve(QEasingCurve.OutCubic)
+        self._geo_anim = anim
+        self._geo_anim_lock = True
+        try:
+            # Jump to the start frame before the first tick (kept out of
+            # _rest_geo by the lock).
+            self.setGeometry(start_geo)
+            anim.start()
+        finally:
+            self._geo_anim_lock = False
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if not self._geo_anim_active():
+            self._rest_geo = self.geometry()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        if not self._geo_anim_active():
+            self._rest_geo = self.geometry()
 
     def closeEvent(self, event):
         self._save_history()
