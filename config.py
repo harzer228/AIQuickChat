@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
         "model": DEFAULT_MODEL,
     },
     "vision": {
+        "enabled": True,
         "account_id": "",
         "model": DEFAULT_VISION_MODEL,
     },
