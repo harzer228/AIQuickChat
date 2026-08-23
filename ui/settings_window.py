@@ -394,23 +394,34 @@ class SettingsWindow(QWidget):
 
         # -- Cloudflare Vision ----------------------------------------------
         vis_section, vis_lay = self._section("settings.vision", "eye")
-        vis_lay.addWidget(self._field_label("settings.account_id"))
+        self.vis_enable_check = QCheckBox()
+        self._text_entries.append((self.vis_enable_check, "settings.enable_vision"))
+        self.vis_enable_check.toggled.connect(self._on_vision_toggle)
+        vis_lay.addWidget(self.vis_enable_check)
+        # API fields collapse when the vision toggle is off; the images are
+        # then sent straight to the main text model.
+        self.vis_fields = QWidget()
+        vis_fields_lay = QVBoxLayout(self.vis_fields)
+        vis_fields_lay.setContentsMargins(0, 0, 0, 0)
+        vis_fields_lay.setSpacing(10)
+        vis_fields_lay.addWidget(self._field_label("settings.account_id"))
         self.vis_account = QLineEdit()
-        vis_lay.addWidget(self.vis_account)
-        vis_lay.addWidget(self._field_label("settings.api_token"))
+        vis_fields_lay.addWidget(self.vis_account)
+        vis_fields_lay.addWidget(self._field_label("settings.api_token"))
         self.vis_token = QLineEdit()
         self.vis_token.setEchoMode(QLineEdit.Password)
-        vis_lay.addWidget(self.vis_token)
-        vis_lay.addWidget(self._field_label("settings.vision_model"))
+        vis_fields_lay.addWidget(self.vis_token)
+        vis_fields_lay.addWidget(self._field_label("settings.vision_model"))
         self.vis_model = QLineEdit()
-        vis_lay.addWidget(self.vis_model)
+        vis_fields_lay.addWidget(self.vis_model)
         self.vis_status = self._status_label()
-        vis_lay.addWidget(self.vis_status)
+        vis_fields_lay.addWidget(self.vis_status)
         self.vis_test_btn = QPushButton()
         self.vis_test_btn.setObjectName("ghost")
         self.vis_test_btn.clicked.connect(self._test_vision)
         self._text_entries.append((self.vis_test_btn, "settings.test_connection"))
-        vis_lay.addWidget(self.vis_test_btn)
+        vis_fields_lay.addWidget(self.vis_test_btn)
+        vis_lay.addWidget(self.vis_fields)
         body_lay.addWidget(vis_section)
 
         # -- Web Search (Tavily / providers) ---------------------------------
@@ -649,6 +660,8 @@ class SettingsWindow(QWidget):
         self.ds_url.setText(cfg.get("deepseek", "api_url", DEFAULT_APP_URL))
         self.ds_key.setText(cfg.get_deepseek_key())
         self.ds_model.setText(cfg.get("deepseek", "model", DEFAULT_MODEL))
+        self.vis_enable_check.setChecked(bool(cfg.get("vision", "enabled", True)))
+        self.vis_fields.setVisible(self.vis_enable_check.isChecked())
         self.vis_account.setText(cfg.get("vision", "account_id", ""))
         self.vis_token.setText(cfg.get_vision_token())
         self.vis_model.setText(cfg.get("vision", "model", DEFAULT_VISION_MODEL))
@@ -716,6 +729,7 @@ class SettingsWindow(QWidget):
         cfg.set_deepseek_key(self.ds_key.text().strip())
         cfg.set("deepseek", "model", self.ds_model.text().strip())
 
+        cfg.set("vision", "enabled", self.vis_enable_check.isChecked())
         cfg.set("vision", "account_id", self.vis_account.text().strip())
         cfg.set_vision_token(self.vis_token.text().strip())
         cfg.set("vision", "model", self.vis_model.text().strip())
@@ -871,6 +885,11 @@ class SettingsWindow(QWidget):
         known = set(PROVIDER_URLS.values())
         if not current or current in known:
             self.ws_url.setText(PROVIDER_URLS.get(self.ws_provider.currentData(), ""))
+
+    def _on_vision_toggle(self, checked: bool):
+        """Collapse the Cloudflare API fields when vision is off."""
+        self.vis_fields.setVisible(checked)
+
 
     def _test_websearch(self):
         self._set_status(self.ws_status, t("settings.testing"))

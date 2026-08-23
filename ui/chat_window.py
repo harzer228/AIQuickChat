@@ -1,5 +1,6 @@
 """Main floating chat window."""
 
+import base64
 import html
 import json
 import re
@@ -561,6 +562,16 @@ class ChatWindow(QWidget):
         self._renumber_tabs()
         self.tabs_widget.setCurrentIndex(0)
 
+    @staticmethod
+    def _history_text(content) -> str:
+        """Plain-text form of a message content (list content keeps its text parts)."""
+        if isinstance(content, list):
+            return "\n".join(
+                part.get("text", "") for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            ).strip()
+        return content or ""
+
     def _save_history(self):
         if not self.config.get("general", "remember_history", False):
             return
@@ -570,15 +581,23 @@ class ChatWindow(QWidget):
                 tab = self.tabs_widget.widget(i)
                 if not isinstance(tab, _ChatTab):
                     continue
-                display = []
+                # Direct-image entries carry base64 content parts; persist
+                # only their text so history.json stays small and loadable.
+                conversation = []
                 for message in tab.conversation:
+                    saved = dict(message)
+                    if isinstance(saved.get("content"), list):
+                        saved["content"] = self._history_text(saved["content"])
+                    conversation.append(saved)
+                display = []
+                for message in conversation:
                     if message["role"] in ("user", "assistant"):
                         display.append({
                             "role": message["role"],
                             "text": message["content"],
                             "has_image": message.get("_image", False),
                         })
-                tabs_data.append({"conversation": tab.conversation, "display": display})
+                tabs_data.append({"conversation": conversation, "display": display})
             history_path().write_text(
                 json.dumps({"tabs": tabs_data}, ensure_ascii=False, indent=2),
                 encoding="utf-8")
@@ -985,8 +1004,23 @@ class ChatWindow(QWidget):
             pixmap = QPixmap.fromImage(image)
             user_bubble = self._add_user_bubble(
                 text, pixmap=pixmap, name=image_name, tab=tab)
-            tab._pending_vision_bubble = user_bubble
-            self._start_vision_task(tab, image, text, image_name)
+            if self._vision_enabled():
+                tab._pending_vision_bubble = user_bubble
+                self._start_vision_task(tab, image, text, image_name)
+            else:
+                # Cloudflare vision is off — hand the image straight to the
+                # main text model (OpenAI-style content parts).
+                parts = []
+                if text:
+                    parts.append({"type": "text", "text": text})
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_uri(image)},
+                })
+                entry = {"role": "user", "content": parts, "_image": True}
+                tab.conversation.append(entry)
+                self._link_bubble(tab, user_bubble, entry)
+                self._start_text_task(tab, text, web_search=self._web_search_enabled())
         else:
             user_bubble = self._add_user_bubble(text, tab=tab)
             entry = {"role": "user", "content": text}
@@ -1215,6 +1249,19 @@ class ChatWindow(QWidget):
             api_token=self.config.get_vision_token(),
             model=self.config.get("vision", "model", DEFAULT_VISION_MODEL),
         )
+
+    def _vision_enabled(self) -> bool:
+        return bool(self.config.get("vision", "enabled", True))
+
+    @staticmethod
+    def _image_data_uri(image) -> str:
+        """Encode a QImage as a PNG data-URI for OpenAI-style image content."""
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.WriteOnly)
+        image.save(buf, "PNG")
+        buf.close()
+        return "data:image/png;base64," + base64.b64encode(bytes(ba)).decode("ascii")
 
     def _web_search_enabled(self) -> bool:
         return bool(self.config.get("web_search", "enabled", False))
