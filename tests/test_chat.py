@@ -66,13 +66,14 @@ def test_edit_allowed_only_for_last_user_message(chat_window):
 
 
 def test_edit_not_allowed_while_busy(chat_window):
+    from ui.chat_window import _TaskState
     tab = _tab(chat_window)
     bubble = _add(chat_window, tab, "user", "q")
-    chat_window._busy = True
+    chat_window._tasks[999] = _TaskState(999, tab)
     try:
         assert not chat_window._edit_allowed(bubble)
     finally:
-        chat_window._busy = False
+        chat_window._tasks.pop(999, None)
 
 
 def test_edit_updates_text_and_resends_to_ai(chat_window, monkeypatch):

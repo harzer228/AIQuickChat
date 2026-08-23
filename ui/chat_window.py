@@ -73,10 +73,12 @@ from ui.widgets import (
     animate_fade_out,
     animate_fade_slide_in,
     make_stylesheet,
+    set_markdown_colors,
     smooth_scroll,
     theme_colors,
 )
 from utils.config_manager import ConfigManager
+from utils.file_reader import DOC_EXTENSIONS, DocumentError, read_document
 from utils.i18n import t
 
 SYSTEM_PROMPT = (
@@ -107,8 +109,6 @@ HTLEFT, HTRIGHT = 10, 11
 HTTOP, HTTOPLEFT, HTTOPRIGHT = 12, 13, 14
 HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 15, 16, 17
 RESIZE_MARGIN = 8  # px from the window border that starts an edge resize
-TEXT_EXTENSIONS = {".txt", ".py", ".js", ".html", ".css", ".json", ".md", ".csv", ".log"}
-MAX_TEXT_FILE_SIZE = 256 * 1024  # 256 KB
 
 
 def _parse_search_decision(reply: str):
@@ -155,6 +155,20 @@ class _ChatTab(QWidget):
         lay.addWidget(self.scroll)
 
 
+class _TaskState:
+    """One in-flight generation task bound to its tab (parallel per tab)."""
+
+    def __init__(self, task_id: int, tab: "_ChatTab"):
+        self.id = task_id
+        self.tab = tab
+        self.cancel_event = threading.Event()
+        self.deepseek = None    # cancellable client, set from the worker thread
+        self.sources = None
+        self.thread = None
+        self.worker = None
+        self.watchdog = None
+
+
 class ChatWindow(QWidget):
     openSettings = Signal()
     exitRequested = Signal()
@@ -165,19 +179,13 @@ class ChatWindow(QWidget):
         self.config = config
         self.pending_image = None       # QImage to send
         self.pending_image_name = ""
-        self._busy = False
-        self._thread = None
-        self._worker = None
-        self._task_tab = None
+        self.pending_docs = []          # [(name, text), ...] attached documents
         self._anim = None
         self._geo_anim = None        # in-flight open/hide scale animation
         self._geo_anim_lock = False  # True while setGeometry() prepares an animation
         self._rest_geo = None        # full-size geometry, never shrunk by animations
         self._quitting = False
-        self._pending_sources = None
-        self._cancel_event = None
-        self._active_deepseek = None
-        self._stop_watchdog = None
+        self._tasks = {}             # task_id -> _TaskState (at most one per tab)
         self._task_id = 0
 
         # Speech-to-Text (dictation) state
@@ -269,6 +277,15 @@ class ChatWindow(QWidget):
         self.preview.removeRequested.connect(self._clear_image)
         self.preview.hide()
         lay.addWidget(self.preview)
+
+        # Attached-document chips (pdf/docx/text files).
+        self.doc_chips_row = QWidget()
+        chips_lay = QHBoxLayout(self.doc_chips_row)
+        chips_lay.setContentsMargins(0, 0, 0, 0)
+        chips_lay.setSpacing(6)
+        chips_lay.addStretch(1)
+        self.doc_chips_row.hide()
+        lay.addWidget(self.doc_chips_row)
 
         # Web Search status banner (Searching the web... / Found N sources).
         self.web_banner = QFrame()
@@ -364,8 +381,13 @@ class ChatWindow(QWidget):
     # ------------------------------------------------------------- styling
 
     def _apply_config(self):
-        self.setStyleSheet(make_stylesheet(self.config.get("appearance", "theme", "dark")))
+        theme = self.config.get("appearance", "theme", "dark")
+        colors = theme_colors(theme)
+        set_markdown_colors(colors)
+        self.setStyleSheet(make_stylesheet(theme))
         self._apply_icon_colors()
+        self._rerender_bubbles()
+        self._refresh_doc_chips()
         self.setWindowOpacity(self._target_opacity())
         width = int(self.config.get_window("width", DEFAULT_WINDOW_WIDTH)
                     or DEFAULT_WINDOW_WIDTH)
@@ -378,6 +400,16 @@ class ChatWindow(QWidget):
         # (a resize of a hidden window may not fire resizeEvent right away).
         geo = self.geometry()
         self._rest_geo = QRect(geo.x(), geo.y(), self.width(), self.height())
+
+    def _rerender_bubbles(self):
+        """Re-render markdown bubbles so theme-baked colors (tables) refresh."""
+        for i in range(self.tabs_widget.count()):
+            tab = self.tabs_widget.widget(i)
+            if not isinstance(tab, _ChatTab):
+                continue
+            for bubble, _entry in tab.links:
+                if bubble.text():
+                    bubble.set_text(bubble.text())
 
     def _apply_icon_colors(self):
         """Recolour all Tabler icons to match the active theme."""
@@ -407,7 +439,7 @@ class ChatWindow(QWidget):
         """Switch the send button between Send (arrow-up) and Stop (square)."""
         colors = theme_colors(self.config.get("appearance", "theme", "dark"))
         white = colors.get("user_message_text", "#FFFFFF")
-        if self._busy:
+        if self._current_task() is not None:
             icon = create_icon("square", 18, white, 2.0, filled=True,
                                disabled_color="#B9B9C4")
             self.send_btn.setToolTip(t("chat.stop_tooltip"))
@@ -447,7 +479,7 @@ class ChatWindow(QWidget):
         self._apply_config()
         self._retranslate()
         self.web_search_btn.setChecked(self._web_search_enabled())
-        self.mic_btn.setEnabled(self._stt_enabled() and not self._busy)
+        self._update_composer_lock()
 
     # ----------------------------------------------------------------- tabs
 
@@ -456,6 +488,27 @@ class ChatWindow(QWidget):
         if isinstance(tab, _ChatTab):
             return tab
         return None
+
+    def _tab_busy(self, tab) -> bool:
+        return any(task.tab is tab for task in self._tasks.values())
+
+    def _current_task(self):
+        """The task running in the CURRENT tab, if any."""
+        tab = self._current_tab()
+        if tab is None:
+            return None
+        for task in self._tasks.values():
+            if task.tab is tab:
+                return task
+        return None
+
+    def _update_composer_lock(self):
+        """Lock the shared composer while the current tab is generating."""
+        busy = self._current_task() is not None
+        self.input.setReadOnly(busy)
+        self.attach_btn.setEnabled(not busy)
+        self.web_search_btn.setEnabled(not busy)
+        self.mic_btn.setEnabled(not busy and self._stt_enabled())
 
     def _renumber_tabs(self):
         for i in range(self.tabs_widget.count()):
@@ -504,8 +557,9 @@ class ChatWindow(QWidget):
         return None
 
     def _close_tab(self, index: int):
-        if self._busy:
-            return
+        target = self.tabs_widget.widget(index)
+        if isinstance(target, _ChatTab) and self._tab_busy(target):
+            return  # a generating tab cannot be closed
         if self.tabs_widget.count() <= 1:
             # Reset the last remaining tab instead of closing it.
             tab = self.tabs_widget.widget(0)
@@ -521,6 +575,8 @@ class ChatWindow(QWidget):
 
     def _on_tab_changed(self, index: int):
         self._update_send_state()
+        self._update_send_button()
+        self._update_composer_lock()
         if self._animations_enabled():
             tab = self._current_tab()
             if tab is not None:
@@ -611,6 +667,8 @@ class ChatWindow(QWidget):
                     continue
                 # Direct-image entries carry base64 content parts; persist
                 # only their text so history.json stays small and loadable.
+                # File messages keep the full text for the model context but
+                # show the short "_display" variant.
                 conversation = []
                 for message in tab.conversation:
                     saved = dict(message)
@@ -622,7 +680,7 @@ class ChatWindow(QWidget):
                     if message["role"] in ("user", "assistant"):
                         display.append({
                             "role": message["role"],
-                            "text": message["content"],
+                            "text": message.get("_display") or message["content"],
                             "has_image": message.get("_image", False),
                         })
                 tabs_data.append({"conversation": conversation, "display": display})
@@ -671,7 +729,8 @@ class ChatWindow(QWidget):
 
     def _wire_bubble_menu(self, bubble, allow_edit: bool, tab):
         bubble.tab = tab or self._current_tab()
-        bubble.set_modify_check(lambda: not self._busy)
+        bubble.set_modify_check(
+            lambda tab=bubble.tab: not self._tab_busy(tab))
         if allow_edit:
             bubble.set_edit_check(lambda b=bubble: self._edit_allowed(b))
         bubble.menu_delete = True
@@ -679,14 +738,16 @@ class ChatWindow(QWidget):
             lambda action, b=bubble: self._on_bubble_action(b, action))
 
     def _edit_allowed(self, bubble) -> bool:
-        """Editing is only offered for the last user message of a tab."""
-        if self._busy:
-            return False
+        """Editing is only offered for the last user message of an idle tab."""
         tab = getattr(bubble, "tab", None)
-        if tab is None or not tab.links or tab.links[-1][0] is not bubble:
+        if tab is None or self._tab_busy(tab):
+            return False
+        if not tab.links or tab.links[-1][0] is not bubble:
             return False
         entry = tab.links[-1][1]
-        return entry.get("role") == "user" and not entry.get("_image")
+        return (entry.get("role") == "user"
+                and not entry.get("_image")
+                and not entry.get("_files"))
 
     def _add_user_bubble(self, text: str, has_image: bool = False,
                          pixmap: QPixmap = None, name: str = "", tab=None):
@@ -742,10 +803,8 @@ class ChatWindow(QWidget):
             if text:
                 QApplication.clipboard().setText(text)
             return
-        if self._busy:
-            return
-        tab = self._current_tab()
-        if tab is None:
+        tab = getattr(bubble, "tab", None) or self._current_tab()
+        if tab is None or self._tab_busy(tab):
             return
         link = next((ln for ln in tab.links if ln[0] is bubble), None)
         if link is None:
@@ -917,34 +976,79 @@ class ChatWindow(QWidget):
                                         f"File: {path}")
                 return
             self._set_pending_image(pixmap.toImage(), Path(path).name)
-        elif suffix in TEXT_EXTENSIONS:
-            self._attach_text_file(path)
+        elif suffix in DOC_EXTENSIONS:
+            self._attach_document(path)
         else:
             self._show_info_bubble(t("chat.file_unsupported"))
 
-    def _attach_text_file(self, path: str):
-        p = Path(path)
+    def _attach_document(self, path: str):
+        """Read a document's text and pin it as a chip above the composer."""
         try:
-            size = p.stat().st_size
-        except OSError:
-            size = 0
-        if size > MAX_TEXT_FILE_SIZE:
-            self._show_info_bubble(
-                t("chat.file_too_large", name=p.name, size=size // 1024,
-                  limit=MAX_TEXT_FILE_SIZE // 1024))
+            text, _truncated = read_document(path)
+        except DocumentError as e:
+            self._show_error_bubble(t(e.key, **e.kwargs), e.detail)
             return
-        try:
-            content = p.read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            self._show_error_bubble(t("chat.error_file_read"), str(e))
-            return
-        if not content.strip():
-            self._show_info_bubble(t("chat.file_empty"))
-            return
-        current = self.input.toPlainText()
-        snippet = t("chat.file_snippet", name=p.name, content=content)
-        self.input.setPlainText((current + snippet) if current else snippet.lstrip())
+        self.pending_docs.append((Path(path).name, text))
+        self._refresh_doc_chips()
+        self._update_send_state()
         self.input.setFocus()
+
+    def _remove_doc(self, index: int):
+        if 0 <= index < len(self.pending_docs):
+            self.pending_docs.pop(index)
+            self._refresh_doc_chips()
+            self._update_send_state()
+
+    def _clear_docs(self):
+        self.pending_docs.clear()
+        self._refresh_doc_chips()
+
+    def _refresh_doc_chips(self):
+        lay = self.doc_chips_row.layout()
+        while lay.count():
+            item = lay.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        colors = theme_colors(self.config.get("appearance", "theme", "dark"))
+        for index, (name, _text) in enumerate(self.pending_docs):
+            chip = QFrame()
+            chip.setObjectName("doc_chip")
+            chip_lay = QHBoxLayout(chip)
+            chip_lay.setContentsMargins(9, 3, 5, 3)
+            chip_lay.setSpacing(6)
+            icon_label = QLabel()
+            icon_label.setPixmap(create_icon("file-text", 13, colors["muted"], 1.6)
+                                 .pixmap(13, 13))
+            chip_lay.addWidget(icon_label)
+            name_label = QLabel(name)
+            name_label.setToolTip(name)
+            chip_lay.addWidget(name_label)
+            remove_btn = IconButton("x", tooltip=t("chat.remove_doc_tooltip"), size=10)
+            remove_btn.setFixedSize(16, 16)
+            remove_btn.clicked.connect(
+                lambda checked=False, i=index: self._remove_doc(i))
+            chip_lay.addWidget(remove_btn)
+            lay.addWidget(chip)
+        lay.addStretch(1)
+        self.doc_chips_row.setVisible(bool(self.pending_docs))
+
+    def _compose_docs_message(self, text: str, docs) -> str:
+        """Full message sent to the model: user text + file snippets."""
+        if not docs:
+            return text
+        snippets = [t("chat.file_snippet", name=name, content=content)
+                    for name, content in docs]
+        return (text + "\n\n" if text else "") + "\n".join(snippets)
+
+    @staticmethod
+    def _docs_display_text(text: str, docs) -> str:
+        """Short variant shown in the bubble: text + attached-file lines."""
+        if not docs:
+            return text
+        lines = [t("chat.file_attached", name=name, count=len(content))
+                 for name, content in docs]
+        return (text + "\n" if text else "") + "\n".join(lines)
 
     # ---------------------------------------------------------------- send
 
@@ -960,12 +1064,12 @@ class ChatWindow(QWidget):
                 "(учитывай их в каждом ответе):\n" + extra)
 
     def _update_send_state(self):
-        if self._busy:
+        if self._current_task() is not None:
             # During generation the button acts as Stop and stays enabled.
             self.send_btn.setEnabled(True)
         else:
             has_text = bool(self.input.toPlainText().strip())
-            enabled = has_text or self.pending_image is not None
+            enabled = has_text or self.pending_image is not None or bool(self.pending_docs)
             if enabled and not self.send_btn.isEnabled() and self._animations_enabled():
                 animate_fade_in(self.send_btn, 150)
             self.send_btn.setEnabled(enabled)
@@ -979,7 +1083,7 @@ class ChatWindow(QWidget):
         self.input.setFixedHeight(max(min_h, min(max_h, height)))
 
     def _on_send_or_stop(self):
-        if self._busy:
+        if self._current_task() is not None:
             self._stop_generation()
         elif self._stt_dictating:
             # Commit the dictation, then send the resulting message.
@@ -989,83 +1093,85 @@ class ChatWindow(QWidget):
             self.send_current()
 
     def _stop_generation(self):
-        """Really interrupt the current DeepSeek task and keep partial text."""
-        if not self._busy:
+        """Really interrupt the current tab's task and keep partial text."""
+        task = self._current_task()
+        if task is None:
             return
-        task_id = self._task_id
-        if self._cancel_event is not None:
-            self._cancel_event.set()
-        if self._active_deepseek is not None:
+        task.cancel_event.set()
+        if task.deepseek is not None:
             try:
-                self._active_deepseek.cancel()
+                task.deepseek.cancel()
             except Exception:
                 pass
         # Safety net: if the worker is stuck (e.g. in a non-cancellable call),
         # finalize the UI state shortly.
-        if self._stop_watchdog is not None:
-            self._stop_watchdog.stop()
-        self._stop_watchdog = QTimer(self)
-        self._stop_watchdog.setSingleShot(True)
-        self._stop_watchdog.setInterval(2500)
-        self._stop_watchdog.timeout.connect(lambda: self._finalize_after_stop(task_id))
-        self._stop_watchdog.start()
+        if task.watchdog is not None:
+            task.watchdog.stop()
+        task.watchdog = QTimer(self)
+        task.watchdog.setSingleShot(True)
+        task.watchdog.setInterval(2500)
+        task.watchdog.timeout.connect(
+            lambda tid=task.id: self._finalize_after_stop(tid))
+        task.watchdog.start()
 
     def _finalize_after_stop(self, task_id: int):
-        if task_id == self._task_id:
+        if task_id in self._tasks:
             self._on_cancelled(task_id)
 
     def send_current(self):
-        if self._busy or self._stt_dictating:
+        tab = self._current_tab()
+        if tab is None or self._tab_busy(tab) or self._stt_dictating:
             return
         text = self.input.toPlainText().strip()
-        if not text and self.pending_image is None:
-            return
-        tab = self._current_tab()
-        if tab is None:
+        docs = list(self.pending_docs)  # copy: cleared below before composing
+        if not text and self.pending_image is None and not docs:
             return
         image = self.pending_image
         image_name = self.pending_image_name
         self._clear_image()
+        self._clear_docs()
         self.input.clear()
 
         if image is not None:
+            # Documents attached together with an image ride along as text.
+            full_text = self._compose_docs_message(text, docs)
+            display = self._docs_display_text(text, docs)
             pixmap = QPixmap.fromImage(image)
             user_bubble = self._add_user_bubble(
-                text, pixmap=pixmap, name=image_name, tab=tab)
+                display, pixmap=pixmap, name=image_name, tab=tab)
             if self._vision_enabled():
                 tab._pending_vision_bubble = user_bubble
-                self._start_vision_task(tab, image, text, image_name)
+                self._start_vision_task(tab, image, full_text, image_name)
             else:
                 # Cloudflare vision is off — hand the image straight to the
                 # main text model (OpenAI-style content parts).
                 parts = []
-                if text:
-                    parts.append({"type": "text", "text": text})
+                if full_text:
+                    parts.append({"type": "text", "text": full_text})
                 parts.append({
                     "type": "image_url",
                     "image_url": {"url": self._image_data_uri(image)},
                 })
                 entry = {"role": "user", "content": parts, "_image": True}
+                if docs:
+                    entry["_files"] = [name for name, _ in docs]
+                    entry["_display"] = display
                 tab.conversation.append(entry)
                 self._link_bubble(tab, user_bubble, entry)
-                self._start_text_task(tab, text, web_search=self._web_search_enabled())
+                self._start_text_task(tab, full_text, web_search=self._web_search_enabled())
         else:
-            user_bubble = self._add_user_bubble(text, tab=tab)
-            entry = {"role": "user", "content": text}
+            # Full content (message + file snippets) goes to the model; the
+            # bubble shows the short variant with attached-file lines.
+            content = self._compose_docs_message(text, docs)
+            display = self._docs_display_text(text, docs)
+            entry = {"role": "user", "content": content}
+            if docs:
+                entry["_files"] = [name for name, _ in docs]
+                entry["_display"] = display
+            user_bubble = self._add_user_bubble(display, tab=tab)
             tab.conversation.append(entry)
             self._link_bubble(tab, user_bubble, entry)
-            self._start_text_task(tab, text, web_search=self._web_search_enabled())
-
-    def _set_busy(self, busy: bool):
-        self._busy = busy
-        self._update_send_state()
-        self._update_send_button()
-        self.input.setReadOnly(busy)
-        self.attach_btn.setEnabled(not busy)
-        self.web_search_btn.setEnabled(not busy)
-        self.mic_btn.setEnabled(not busy and self._stt_enabled())
-        if busy and self._animations_enabled():
-            animate_fade_in(self.send_btn, 120)
+            self._start_text_task(tab, text or display, web_search=self._web_search_enabled())
 
     # ------------------------------------------------------------- speech-to-text
 
@@ -1123,7 +1229,7 @@ class ChatWindow(QWidget):
         QTimer.singleShot(0, self._start_dictation)
 
     def _start_dictation(self):
-        if self._stt_active or self._busy:
+        if self._stt_active or self._current_task() is not None:
             return
         if not self._stt_enabled():
             self._stt_show_status(t("stt.disabled_in_settings"), error=True)
@@ -1262,13 +1368,14 @@ class ChatWindow(QWidget):
 
     # -------------------------------------------------------------- workers
 
-    def _make_deepseek(self) -> DeepSeekClient:
+    def _make_deepseek(self, task: _TaskState = None) -> DeepSeekClient:
         client = DeepSeekClient(
             api_url=self.config.get("deepseek", "api_url", DEFAULT_APP_URL),
             api_key=self.config.get_deepseek_key(),
             model=self.config.get("deepseek", "model", DEFAULT_MODEL),
         )
-        self._active_deepseek = client
+        if task is not None:
+            task.deepseek = client  # lets Stop() abort this task's stream
         return client
 
     def _make_vision(self) -> CloudflareVisionClient:
@@ -1320,29 +1427,30 @@ class ChatWindow(QWidget):
             self.web_banner.hide()
 
     def _start_text_task(self, tab: _ChatTab, question: str, web_search: bool = False):
-        self._set_busy(True)
-        self._task_tab = tab
         self._task_id += 1
-        task_id = self._task_id
-        self._pending_sources = None
-        self._cancel_event = threading.Event()
-        self._active_deepseek = None
+        task = _TaskState(self._task_id, tab)
+        self._tasks[task.id] = task
+        cancel_event = task.cancel_event
         if web_search:
             self._show_thinking(t("chat.thinking_decision"), tab)
         else:
             self._show_thinking(t("chat.thinking"), tab)
         messages = ([{"role": "system", "content": self._system_prompt()}]
                     + list(tab.conversation))
+        if tab is self._current_tab():
+            self._update_send_state()
+            self._update_send_button()
+            self._update_composer_lock()
 
         def cancelled():
-            return self._cancel_event is not None and self._cancel_event.is_set()
+            return cancel_event.is_set()
 
         def generator():
-            deepseek = self._make_deepseek()
+            deepseek = self._make_deepseek(task)
 
             def stream(msgs):
                 try:
-                    for chunk in deepseek.stream_message(msgs, cancel_event=self._cancel_event):
+                    for chunk in deepseek.stream_message(msgs, cancel_event=cancel_event):
                         if cancelled():
                             raise GenerationCancelled()
                         yield ("chunk", chunk)
@@ -1407,17 +1515,18 @@ class ChatWindow(QWidget):
             for item in stream(enriched):
                 yield item
 
-        self._run_generator(generator(), task_id)
+        self._run_generator(generator(), task)
 
     def _start_vision_task(self, tab: _ChatTab, image, question: str, image_name: str):
-        self._set_busy(True)
-        self._task_tab = tab
         self._task_id += 1
-        task_id = self._task_id
-        self._pending_sources = None
-        self._cancel_event = threading.Event()
-        self._active_deepseek = None
+        task = _TaskState(self._task_id, tab)
+        self._tasks[task.id] = task
+        cancel_event = task.cancel_event
         self._show_thinking(t("chat.thinking_image"), tab)
+        if tab is self._current_tab():
+            self._update_send_state()
+            self._update_send_button()
+            self._update_composer_lock()
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.WriteOnly)
@@ -1426,7 +1535,7 @@ class ChatWindow(QWidget):
         image_bytes = bytes(ba)
 
         def generator():
-            deepseek = self._make_deepseek()
+            deepseek = self._make_deepseek(task)
             vision = self._make_vision()
             try:
                 description = vision.analyze_image_bytes(
@@ -1434,7 +1543,7 @@ class ChatWindow(QWidget):
             except APIError as e:
                 yield ("error", e.message, e.detail)
                 return
-            if self._cancel_event is not None and self._cancel_event.is_set():
+            if cancel_event.is_set():
                 yield ("cancelled",)
                 return
             user_content = build_deepseek_image_message(description, question)
@@ -1443,8 +1552,8 @@ class ChatWindow(QWidget):
                         + list(tab.conversation)
                         + [{"role": "user", "content": user_content}])
             try:
-                for chunk in deepseek.stream_message(messages, cancel_event=self._cancel_event):
-                    if self._cancel_event is not None and self._cancel_event.is_set():
+                for chunk in deepseek.stream_message(messages, cancel_event=cancel_event):
+                    if cancel_event.is_set():
                         raise GenerationCancelled()
                     yield ("chunk", chunk)
             except GenerationCancelled:
@@ -1457,11 +1566,11 @@ class ChatWindow(QWidget):
             # (see _on_vision_entry) so the bubble link stays consistent.
             yield ("vuser", user_content)
 
-        self._run_generator(generator(), task_id)
+        self._run_generator(generator(), task)
 
-    def _run_generator(self, generator, task_id: int):
+    def _run_generator(self, generator, task: _TaskState):
         thread = QThread(self)
-        worker = _GeneratorWorker(generator, task_id=task_id)
+        worker = _GeneratorWorker(generator, task_id=task.id)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.status.connect(self._on_status)
@@ -1475,41 +1584,42 @@ class ChatWindow(QWidget):
         worker.error.connect(self._on_error)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(worker.deleteLater)
-        self._thread = thread
-        self._worker = worker
+        task.thread = thread
+        task.worker = worker
         thread.start()
 
     def _on_status(self, task_id: int, text: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        tab = self._task_tab or self._current_tab()
-        if tab is not None and tab._thinking is not None:
-            tab._thinking.set_status(text)
+        if task.tab._thinking is not None:
+            task.tab._thinking.set_status(text)
 
     def _on_info(self, task_id: int, text: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        tab = self._task_tab or self._current_tab()
-        if tab is not None:
-            self._show_info_bubble(text, tab)
+        self._show_info_bubble(text, task.tab)
 
     def _on_webstatus(self, task_id: int, text: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        # The single banner only reports on the tab the user is looking at.
+        if task is None or task.tab is not self._current_tab():
             return
         self._show_web_banner(text)
 
     def _on_sources(self, task_id: int, sources):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        self._pending_sources = sources
+        task.sources = sources
 
     def _on_vision_entry(self, task_id: int, user_content: str):
         """Append the enriched vision user entry and link it to its bubble."""
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        tab = self._task_tab or self._current_tab()
-        if tab is None:
-            return
+        tab = task.tab
         entry = {"role": "user", "content": user_content, "_image": True}
         tab.conversation.append(entry)
         bubble = getattr(tab, "_pending_vision_bubble", None)
@@ -1518,11 +1628,10 @@ class ChatWindow(QWidget):
             tab._pending_vision_bubble = None
 
     def _on_chunk(self, task_id: int, chunk: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        tab = self._task_tab or self._current_tab()
-        if tab is None:
-            return
+        tab = task.tab
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is None:
@@ -1531,13 +1640,10 @@ class ChatWindow(QWidget):
         self._scroll_to_bottom(tab)
 
     def _on_done(self, task_id: int, full_text: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        if not self._busy and self._task_tab is None:
-            return
-        tab = self._task_tab or self._current_tab()
-        if tab is None:
-            return
+        tab = task.tab
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is not None:
@@ -1547,28 +1653,28 @@ class ChatWindow(QWidget):
                 entry = {"role": "assistant", "content": full_text}
                 tab.conversation.append(entry)
                 self._link_bubble(tab, tab._assistant_bubble, entry)
-                if self._pending_sources:
+                if task.sources:
                     colors = theme_colors(
                         self.config.get("appearance", "theme", "dark"))
                     tab._assistant_bubble.add_sources(
-                        self._pending_sources, colors["accent"], colors["muted"])
+                        task.sources, colors["accent"], colors["muted"])
             tab._assistant_bubble = None
-        if self._pending_sources:
-            count = len(self._pending_sources)
-            self._show_web_banner(t("chat.web_found", count=count))
-            QTimer.singleShot(2600, self._hide_web_banner)
-        else:
-            self._hide_web_banner()
-        self._pending_sources = None
-        self._finish_worker()
+        if tab is self._current_tab():
+            if task.sources:
+                count = len(task.sources)
+                self._show_web_banner(t("chat.web_found", count=count))
+                QTimer.singleShot(2600, self._hide_web_banner)
+            else:
+                self._hide_web_banner()
+        task.sources = None
+        self._finish_worker(task_id)
 
     def _on_cancelled(self, task_id: int):
         """Generation was stopped by the user — keep the partial answer."""
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        tab = self._task_tab or self._current_tab()
-        if tab is None:
-            return
+        tab = task.tab
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is not None:
@@ -1579,41 +1685,43 @@ class ChatWindow(QWidget):
                 self._link_bubble(tab, tab._assistant_bubble, entry)
             tab._assistant_bubble = None
             self._show_info_bubble(t("chat.stopped"), tab)
-        self._hide_web_banner()
-        self._pending_sources = None
-        self._finish_worker()
+        if tab is self._current_tab():
+            self._hide_web_banner()
+        task.sources = None
+        self._finish_worker(task_id)
 
     def _on_error(self, task_id: int, message: str, detail: str):
-        if task_id != self._task_id:
+        task = self._tasks.get(task_id)
+        if task is None:
             return
-        if not self._busy and self._task_tab is None:
-            return
-        tab = self._task_tab or self._current_tab()
-        if tab is None:
-            return
+        tab = task.tab
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is not None:
             tab._assistant_bubble = None
         self._show_error_bubble(t("chat.error_generic_title", message=message),
                                 detail, tab)
-        self._hide_web_banner()
-        self._pending_sources = None
-        self._finish_worker()
+        if tab is self._current_tab():
+            self._hide_web_banner()
+        task.sources = None
+        self._finish_worker(task_id)
 
-    def _finish_worker(self):
-        self._set_busy(False)
-        self._task_tab = None
-        if self._stop_watchdog is not None:
-            self._stop_watchdog.stop()
-            self._stop_watchdog = None
-        self._cancel_event = None
-        self._active_deepseek = None
-        thread = self._thread
-        self._thread = None
-        self._worker = None
+    def _finish_worker(self, task_id: int):
+        task = self._tasks.pop(task_id, None)
+        if task is None:
+            return
+        if task.watchdog is not None:
+            task.watchdog.stop()
+            task.watchdog = None
+        thread = task.thread
+        task.thread = None
+        task.worker = None
         if thread is not None and thread.isRunning():
             thread.quit()
+        if task.tab is self._current_tab():
+            self._update_send_state()
+            self._update_send_button()
+            self._update_composer_lock()
         self._save_history()
 
     # ---------------------------------------------------------------- events

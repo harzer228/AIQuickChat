@@ -668,6 +668,16 @@ QLabel code {{
 }}
 QLabel blockquote {{ color: {c['text_secondary']}; border-left: 3px solid {c['accent']}; padding-left: 10px; }}
 
+#doc_chip {{
+    background-color: {c['surface_secondary']};
+    border: 1px solid {c['border']};
+    border-radius: 11px;
+}}
+#doc_chip QLabel {{
+    background: transparent; border: none;
+    color: {c['text']}; font-size: 12px;
+}}
+
 QTextEdit#input {{
     background-color: transparent; border: none;
     color: {c['text']}; font-size: 13px; padding: 9px 6px;
@@ -788,6 +798,15 @@ _INLINE_CODE_RE = re.compile(r"`([^`]+)`")
 _BOLD_RE = re.compile(r"\*\*([^*]+)\*\*")
 _ITALIC_RE = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
 
+# Theme colors baked into rich-text markup (tables). Set by ChatWindow on
+# theme apply; Qt QSS cannot style rich-text inner elements like tables.
+_MARKDOWN_COLORS = {}
+
+
+def set_markdown_colors(colors: dict):
+    _MARKDOWN_COLORS.clear()
+    _MARKDOWN_COLORS.update(colors or {})
+
 
 def _inline(text: str) -> str:
     text = html.escape(text)
@@ -797,11 +816,67 @@ def _inline(text: str) -> str:
     return text
 
 
+def _split_table_row(line: str) -> list:
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [cell.strip() for cell in s.split("|")]
+
+
+_TABLE_ALIGN_RE = re.compile(r"^:?-{3,}:?$")
+
+
+def _table_alignment(cell: str) -> str:
+    left = cell.startswith(":")
+    right = cell.endswith(":")
+    if left and right:
+        return "center"
+    if right:
+        return "right"
+    return "left"
+
+
+def _is_table_separator(line: str) -> bool:
+    cells = _split_table_row(line)
+    return bool(cells) and all(_TABLE_ALIGN_RE.match(c) for c in cells if c != "")
+
+
+def _table_cell(tag: str, cell: str, align: str, header: bool) -> str:
+    attrs = ""
+    if header and _MARKDOWN_COLORS.get("surface_secondary"):
+        attrs += f' bgcolor="{_MARKDOWN_COLORS["surface_secondary"]}"'
+    if align and align != "left":
+        attrs += f' align="{align}"'
+    return f"<{tag}{attrs}>{_inline(cell)}</{tag}>"
+
+
+def _table_html(header, aligns, rows) -> str:
+    attrs = ['width="100%"', 'border="1"', 'cellspacing="0"', 'cellpadding="6"']
+    border = _MARKDOWN_COLORS.get("border")
+    if border:
+        attrs.append(f'bordercolor="{border}"')
+    parts = ["<table " + " ".join(attrs) + ">"]
+    parts.append("<tr>" + "".join(
+        _table_cell("th", cell, align, header=True)
+        for cell, align in zip(header, aligns)) + "</tr>")
+    for row in rows:
+        parts.append("<tr>" + "".join(
+            _table_cell("td", cell, align, header=False)
+            for cell, align in zip(row, aligns)) + "</tr>")
+    parts.append("</table>")
+    return "".join(parts)
+
+
 def markdown_to_html(text: str) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
     out = []
     para = []
     list_items = []
+    quote_lines = []
+    table = None  # (header, aligns, rows) while inside a GFM pipe table
     in_code = False
     code_lines = []
 
@@ -815,45 +890,90 @@ def markdown_to_html(text: str) -> str:
             out.append("<ul>" + "".join(f"<li>{_inline(x)}</li>" for x in list_items) + "</ul>")
             list_items.clear()
 
-    for line in text.split("\n"):
+    def flush_quote():
+        # Consecutive ">" lines merge into a single bordered quote.
+        if quote_lines:
+            body = "<br>".join(_inline(x) if x else "<br>" for x in quote_lines)
+            out.append(f"<blockquote>{body}</blockquote>")
+            quote_lines.clear()
+
+    def flush_table():
+        nonlocal table
+        if table is not None:
+            header, aligns, rows = table
+            out.append(_table_html(header, aligns, rows))
+            table = None
+
+    def flush_all():
+        flush_para()
+        flush_list()
+        flush_quote()
+        flush_table()
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         stripped = line.strip()
         if stripped.startswith("```"):
-            flush_para()
-            flush_list()
+            flush_all()
             if in_code:
                 out.append('<pre class="code">' + html.escape("\n".join(code_lines)) + "</pre>")
                 code_lines = []
                 in_code = False
             else:
                 in_code = True
+            i += 1
             continue
         if in_code:
             code_lines.append(line)
+            i += 1
             continue
+        # GFM table: header row followed by a |---|---| separator row.
+        if (table is None and stripped.startswith("|")
+                and i + 1 < len(lines) and _is_table_separator(lines[i + 1])):
+            flush_para()
+            flush_list()
+            flush_quote()
+            header = _split_table_row(stripped)
+            aligns = [_table_alignment(c) for c in _split_table_row(lines[i + 1])]
+            table = (header, aligns, [])
+            i += 2
+            continue
+        if table is not None:
+            if stripped.startswith("|"):
+                table[2].append(_split_table_row(stripped))
+                i += 1
+                continue
+            flush_table()
         if stripped.startswith("#"):
             flush_para()
             flush_list()
+            flush_quote()
             level = min(len(stripped) - len(stripped.lstrip("#")), 4)
             out.append(f"<h{level + 2}>{_inline(stripped.lstrip('#').strip())}</h{level + 2}>")
         elif stripped.startswith(("- ", "* ", "• ")):
             flush_para()
+            flush_quote()
             list_items.append(stripped[2:].strip())
         elif stripped in ("---", "***", "___"):
             flush_para()
             flush_list()
+            flush_quote()
             out.append("<hr>")
         elif stripped.startswith(">"):
             flush_para()
             flush_list()
-            out.append("<blockquote>" + _inline(stripped.lstrip(">").strip()) + "</blockquote>")
+            quote_lines.append(stripped.lstrip(">").strip())
         elif not stripped:
             flush_para()
             flush_list()
+            flush_quote()
         else:
             flush_list()
+            flush_quote()
             para.append(stripped)
-    flush_para()
-    flush_list()
+        i += 1
+    flush_all()
     if in_code:
         out.append('<pre class="code">' + html.escape("\n".join(code_lines)) + "</pre>")
     return "".join(out)
