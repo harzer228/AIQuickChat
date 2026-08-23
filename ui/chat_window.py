@@ -409,7 +409,9 @@ class ChatWindow(QWidget):
                 continue
             for bubble, _entry in tab.links:
                 if bubble.text():
-                    bubble.set_text(bubble.text())
+                    # force=True re-renders cached table blocks with the
+                    # fresh theme colors (set_markdown_colors above).
+                    bubble.set_text(bubble.text(), force=True)
 
     def _apply_icon_colors(self):
         """Recolour all Tabler icons to match the active theme."""
