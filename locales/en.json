@@ -64,6 +64,9 @@
   "settings.language": "Language",
   "settings.animation": "Show animations",
   "settings.opacity": "Window opacity",
+  "settings.window_width": "Window width",
+  "settings.window_height": "Window height",
+  "settings.px_suffix": " px",
 
   "settings.memory": "AI Memory",
   "settings.memory_enable": "Enable memory",

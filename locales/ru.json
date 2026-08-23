@@ -64,6 +64,9 @@
   "settings.language": "Язык",
   "settings.animation": "Показывать анимации",
   "settings.opacity": "Прозрачность окна",
+  "settings.window_width": "Ширина окна",
+  "settings.window_height": "Высота окна",
+  "settings.px_suffix": " px",
 
   "settings.memory": "Память ИИ",
   "settings.memory_enable": "Использовать память",

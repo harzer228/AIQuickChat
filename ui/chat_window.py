@@ -1,11 +1,13 @@
 """Main floating chat window."""
 
 import base64
+import ctypes
 import html
 import json
 import re
 import threading
 import traceback
+from ctypes import wintypes
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -14,6 +16,7 @@ from PySide6.QtCore import (
     QEasingCurve,
     QIODevice,
     QObject,
+    QPoint,
     QPropertyAnimation,
     QRect,
     QSize,
@@ -51,6 +54,12 @@ from config import (
     DEFAULT_VISION_MODEL,
     DEFAULT_WEBSEARCH_PROVIDER,
     DEFAULT_WEBSEARCH_URL,
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
+    WINDOW_MAX_HEIGHT,
+    WINDOW_MAX_WIDTH,
+    WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
     history_path,
 )
 from stt.engine import SpeechWorker, device_exists, model_is_valid
@@ -91,6 +100,13 @@ SEARCH_DECISION_SYSTEM = (
 )
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+# Native edge-resize via WM_NCHITTEST (frameless window).
+WM_NCHITTEST = 0x0084
+HTLEFT, HTRIGHT = 10, 11
+HTTOP, HTTOPLEFT, HTTOPRIGHT = 12, 13, 14
+HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 15, 16, 17
+RESIZE_MARGIN = 8  # px from the window border that starts an edge resize
 TEXT_EXTENSIONS = {".txt", ".py", ".js", ".html", ".css", ".json", ".md", ".csv", ".log"}
 MAX_TEXT_FILE_SIZE = 256 * 1024  # 256 KB
 
@@ -180,6 +196,10 @@ class ChatWindow(QWidget):
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("AI Quick Chat")
+        # Hard size bounds — nothing (animations, edge resize, config) can
+        # push the window outside these limits.
+        self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
+        self.setMaximumSize(WINDOW_MAX_WIDTH, WINDOW_MAX_HEIGHT)
 
         self._build_ui()
         self._apply_config()
@@ -347,9 +367,17 @@ class ChatWindow(QWidget):
         self.setStyleSheet(make_stylesheet(self.config.get("appearance", "theme", "dark")))
         self._apply_icon_colors()
         self.setWindowOpacity(self._target_opacity())
-        self.resize(
-            self.config.get_window("width", 470),
-            self.config.get_window("height", 640))
+        width = int(self.config.get_window("width", DEFAULT_WINDOW_WIDTH)
+                    or DEFAULT_WINDOW_WIDTH)
+        height = int(self.config.get_window("height", DEFAULT_WINDOW_HEIGHT)
+                     or DEFAULT_WINDOW_HEIGHT)
+        width = max(WINDOW_MIN_WIDTH, min(WINDOW_MAX_WIDTH, width))
+        height = max(WINDOW_MIN_HEIGHT, min(WINDOW_MAX_HEIGHT, height))
+        self.resize(width, height)
+        # Keep the canonical resting geometry in sync even while hidden
+        # (a resize of a hidden window may not fire resizeEvent right away).
+        geo = self.geometry()
+        self._rest_geo = QRect(geo.x(), geo.y(), self.width(), self.height())
 
     def _apply_icon_colors(self):
         """Recolour all Tabler icons to match the active theme."""
@@ -1656,14 +1684,13 @@ class ChatWindow(QWidget):
             end_h = int(resting.height() * 0.96)
             end_geo = QRect(center.x() - end_w // 2, center.y() - end_h // 2, end_w, end_h)
             self._scale_to(resting, end_geo, 130)
-            if self._anim is not None:
-                self._anim.stop()
+            self._stop_opacity_anim()
             anim_op = QPropertyAnimation(self, b"windowOpacity", self)
             anim_op.setDuration(130)
             anim_op.setStartValue(self.windowOpacity())
             anim_op.setEndValue(0.0)
             anim_op.setEasingCurve(QEasingCurve.InCubic)
-            anim_op.finished.connect(self.hide)
+            anim_op.finished.connect(self._on_hide_anim_finished)
             anim_op.start()
             self._anim = anim_op
         else:
@@ -1681,8 +1708,7 @@ class ChatWindow(QWidget):
         start_h = int(target.height() * 0.96)
         start_geo = QRect(center.x() - start_w // 2, center.y() - start_h // 2, start_w, start_h)
         self._scale_to(start_geo, target, 170)
-        if self._anim is not None:
-            self._anim.stop()
+        self._stop_opacity_anim()
         anim_op = QPropertyAnimation(self, b"windowOpacity", self)
         anim_op.setDuration(170)
         anim_op.setStartValue(0.0)
@@ -1690,6 +1716,27 @@ class ChatWindow(QWidget):
         anim_op.setEasingCurve(QEasingCurve.OutCubic)
         anim_op.start()
         self._anim = anim_op
+
+    def _stop_opacity_anim(self):
+        """Stop the opacity animation without firing its finished slot —
+        QAbstractAnimation.stop() emits finished(), which would run the
+        stale hide() right after a fresh show()."""
+        if self._anim is not None:
+            self._anim.blockSignals(True)
+            self._anim.stop()
+            self._anim.blockSignals(False)
+            self._anim = None
+
+    def _on_hide_anim_finished(self):
+        self.hide()
+        # Park the hidden window at its full-size geometry one cycle later:
+        # the scale animation's last write reaches the QWindow asynchronously
+        # and would overwrite a synchronous reset with the shrunk frame.
+        QTimer.singleShot(0, self._park_hidden_geometry)
+
+    def _park_hidden_geometry(self):
+        if not self.isVisible():
+            self.setGeometry(self._resting_geometry())
 
     # ------------------------------------------------------- scale animations
 
@@ -1724,12 +1771,57 @@ class ChatWindow(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if not self._geo_anim_active():
-            self._rest_geo = self.geometry()
+            geo = self.geometry()
+            self._rest_geo = geo
+            # Keep the configured size in sync with manual (edge) resizes;
+            # it only reaches disk on the next regular config save.
+            self.config.set_window("width", geo.width())
+            self.config.set_window("height", geo.height())
 
     def moveEvent(self, event):
         super().moveEvent(event)
         if not self._geo_anim_active():
             self._rest_geo = self.geometry()
+
+    def nativeEvent(self, eventType, message):
+        if eventType == "windows_generic_MSG":
+            try:
+                msg = wintypes.MSG.from_address(int(message))
+            except Exception:
+                return super().nativeEvent(eventType, message)
+            if msg.message == WM_NCHITTEST:
+                # Screen coordinates may be negative on multi-monitor setups.
+                x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                hit = self._edge_hit(self.mapFromGlobal(QPoint(x, y)))
+                if hit:
+                    return True, hit
+        return super().nativeEvent(eventType, message)
+
+    def _edge_hit(self, pos) -> int:
+        """Return the HT* border code when the point is on a resize edge, else 0."""
+        margin = RESIZE_MARGIN
+        left = pos.x() < margin
+        right = pos.x() >= self.width() - margin
+        top = pos.y() < margin
+        bottom = pos.y() >= self.height() - margin
+        if top and left:
+            return HTTOPLEFT
+        if top and right:
+            return HTTOPRIGHT
+        if bottom and left:
+            return HTBOTTOMLEFT
+        if bottom and right:
+            return HTBOTTOMRIGHT
+        if left:
+            return HTLEFT
+        if right:
+            return HTRIGHT
+        if top:
+            return HTTOP
+        if bottom:
+            return HTBOTTOM
+        return 0
 
     def closeEvent(self, event):
         self._save_history()

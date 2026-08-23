@@ -44,6 +44,12 @@ from config import (
     DEFAULT_WEBSEARCH_PROVIDER,
     DEFAULT_WEBSEARCH_TIMEOUT,
     DEFAULT_WEBSEARCH_URL,
+    DEFAULT_WINDOW_HEIGHT,
+    DEFAULT_WINDOW_WIDTH,
+    WINDOW_MAX_HEIGHT,
+    WINDOW_MAX_WIDTH,
+    WINDOW_MIN_HEIGHT,
+    WINDOW_MIN_WIDTH,
 )
 from stt.engine import list_microphones, model_is_valid
 from ui.icons import IconButton, create_icon
@@ -286,6 +292,26 @@ class SettingsWindow(QWidget):
         self.opacity_slider.valueChanged.connect(
             lambda v: self.opacity_value.setText(f"{v}%"))
         app_lay.addLayout(opacity_row)
+        app_lay.addWidget(self._field_label("settings.window_width"))
+        width_row = QHBoxLayout()
+        width_row.setSpacing(8)
+        self.win_width = QSpinBox()
+        self.win_width.setRange(WINDOW_MIN_WIDTH, WINDOW_MAX_WIDTH)
+        self.win_width.setValue(DEFAULT_WINDOW_WIDTH)
+        self.win_width.setSuffix(t("settings.px_suffix"))
+        width_row.addWidget(self.win_width)
+        width_row.addStretch(1)
+        app_lay.addLayout(width_row)
+        app_lay.addWidget(self._field_label("settings.window_height"))
+        height_row = QHBoxLayout()
+        height_row.setSpacing(8)
+        self.win_height = QSpinBox()
+        self.win_height.setRange(WINDOW_MIN_HEIGHT, WINDOW_MAX_HEIGHT)
+        self.win_height.setValue(DEFAULT_WINDOW_HEIGHT)
+        self.win_height.setSuffix(t("settings.px_suffix"))
+        height_row.addWidget(self.win_height)
+        height_row.addStretch(1)
+        app_lay.addLayout(height_row)
         self.anim_check = QCheckBox()
         self._text_entries.append((self.anim_check, "settings.animation"))
         app_lay.addWidget(self.anim_check)
@@ -596,6 +622,8 @@ class SettingsWindow(QWidget):
             widget.setText(t(key))
         self.close_btn.setToolTip(t("common.close"))
         self.ws_timeout.setSuffix(t("settings.sec_suffix"))
+        self.win_width.setSuffix(t("settings.px_suffix"))
+        self.win_height.setSuffix(t("settings.px_suffix"))
         self.stt_silence.setSuffix(t("stt.sec_suffix"))
         self.stt_mic_refresh.setToolTip(t("settings.refresh"))
         if self.stt_mic_combo.count():
@@ -683,6 +711,16 @@ class SettingsWindow(QWidget):
         self.lang_combo.setCurrentIndex(index if index >= 0 else 0)
         opacity = int(round(float(cfg.get("appearance", "opacity", 0.92)) * 100))
         self.opacity_slider.setValue(max(60, min(100, opacity)))
+        self.win_width.setValue(max(
+            WINDOW_MIN_WIDTH,
+            min(WINDOW_MAX_WIDTH,
+                int(cfg.get_window("width", DEFAULT_WINDOW_WIDTH)
+                    or DEFAULT_WINDOW_WIDTH))))
+        self.win_height.setValue(max(
+            WINDOW_MIN_HEIGHT,
+            min(WINDOW_MAX_HEIGHT,
+                int(cfg.get_window("height", DEFAULT_WINDOW_HEIGHT)
+                    or DEFAULT_WINDOW_HEIGHT))))
         self.anim_check.setChecked(bool(cfg.get("appearance", "animations", True)))
 
         self.memory_enabled_check.setChecked(bool(cfg.get("memory", "enabled", False)))
@@ -760,6 +798,8 @@ class SettingsWindow(QWidget):
         set_language(self.lang_combo.currentData())
         cfg.set("appearance", "opacity", self.opacity_slider.value() / 100.0)
         cfg.set("appearance", "animations", self.anim_check.isChecked())
+        cfg.set_window("width", self.win_width.value())
+        cfg.set_window("height", self.win_height.value())
         cfg.set("memory", "enabled", self.memory_enabled_check.isChecked())
         cfg.set("memory", "context", self.memory_text.toPlainText().strip())
         cfg.set("general", "start_with_windows", self.start_check.isChecked())
