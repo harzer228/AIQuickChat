@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "AIQuickChat"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1"
 
 DEFAULT_APP_URL = "https://routerai.ru/api/v1"
 DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
