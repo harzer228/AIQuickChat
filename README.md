@@ -1,5 +1,7 @@
 # AI Quick Chat
 
+**[🇷🇺 Русский](README.md)** | **[🇬🇧 English](README.en.md)**
+
 [![CI](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml/badge.svg)](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml)
 
 Быстрый **desktop AI-ассистент для Windows**. Вызывается глобальной горячей
@@ -359,7 +361,8 @@ AIQuickChat/
 ├── requirements.txt         # runtime-зависимости
 ├── requirements-dev.txt     # dev/CI-зависимости (pytest, ruff, pyinstaller...)
 ├── LICENSE                  # MIT
-└── README.md
+├── README.md                # документация (русский)
+└── README.en.md             # documentation (English)
 ```
 
 ## Настройки приложения
