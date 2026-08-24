@@ -1,6 +1,7 @@
 """Shared UI widgets, theming and helpers."""
 
 import html
+import math
 import re
 import traceback
 
@@ -14,7 +15,7 @@ from PySide6.QtCore import (
     QTimer,
     Signal,
 )
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
@@ -22,6 +23,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -600,6 +603,11 @@ QFrame#websearch_banner {{
     background-color: {c['accent_soft']}; border: 1px solid {c['border']};
     border-radius: 10px;
 }}
+QScrollArea#table_scroll {{
+    background-color: {c['surface']}; border: 1px solid {c['border']};
+    border-radius: 8px;
+}}
+QScrollArea#table_scroll QLabel {{ background: transparent; border: none; }}
 QLabel#sources_title {{ color: {c['text_secondary']}; font-size: 11px; font-weight: 700; letter-spacing: 0.5px; }}
 QFrame#sources_sep {{ background-color: {c['border']}; }}
 
@@ -694,8 +702,16 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 6px; margin: 2px; }}
 QScrollBar::handle:horizontal {{ background: {c['scroll']}; border-radius: 3px; min-width: 30px; }}
+QScrollBar::handle:horizontal:hover {{ background: {c['text_secondary']}; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+
+/* Table blocks: chunkier scrollbars that are easier to grab. Hover glow
+   is inherited from the global rules above. */
+QScrollArea#table_scroll QScrollBar:vertical {{ width: 10px; margin: 1px; }}
+QScrollArea#table_scroll QScrollBar::handle:vertical {{ border-radius: 4px; min-height: 24px; }}
+QScrollArea#table_scroll QScrollBar:horizontal {{ height: 10px; margin: 1px; }}
+QScrollArea#table_scroll QScrollBar::handle:horizontal {{ border-radius: 4px; min-width: 24px; }}
 
 QTabWidget::pane {{ border: none; background: transparent; }}
 QTabBar {{ background: transparent; qproperty-drawBase: 0; }}
@@ -843,6 +859,48 @@ def _is_table_separator(line: str) -> bool:
     return bool(cells) and all(_TABLE_ALIGN_RE.match(c) for c in cells if c != "")
 
 
+def _table_start(lines, i: int):
+    """(header, aligns) when lines[i] opens a GFM table, else None."""
+    stripped = lines[i].strip()
+    if not stripped.startswith("|"):
+        return None
+    if i + 1 >= len(lines) or not _is_table_separator(lines[i + 1]):
+        return None
+    header = _split_table_row(stripped)
+    aligns = [_table_alignment(c) for c in _split_table_row(lines[i + 1])]
+    return header, aligns
+
+
+def split_markdown_blocks(text: str) -> list:
+    """Split markdown into [("text", md) | ("table", md)] blocks.
+
+    Tables become standalone blocks so the UI can render each one inside
+    its own scrollable area.
+    """
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    blocks = []
+    text_lines = []
+    i = 0
+    while i < len(lines):
+        if _table_start(lines, i) is not None:
+            if any(part.strip() for part in text_lines):
+                blocks.append(("text", "\n".join(text_lines)))
+            text_lines = []
+            table_lines = [lines[i], lines[i + 1]]
+            i += 2
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            blocks.append(("table", "\n".join(table_lines)))
+            continue
+        text_lines.append(lines[i])
+        i += 1
+    if any(part.strip() for part in text_lines):
+        blocks.append(("text", "\n".join(text_lines)))
+    return blocks
+
+
 def _table_cell(tag: str, cell: str, align: str, header: bool) -> str:
     attrs = ""
     if header and _MARKDOWN_COLORS.get("surface_secondary"):
@@ -852,8 +910,11 @@ def _table_cell(tag: str, cell: str, align: str, header: bool) -> str:
     return f"<{tag}{attrs}>{_inline(cell)}</{tag}>"
 
 
-def _table_html(header, aligns, rows) -> str:
-    attrs = ['width="100%"', 'border="1"', 'cellspacing="0"', 'cellpadding="6"']
+def _table_html(header, aligns, rows, natural: bool = False) -> str:
+    # Natural tables keep their intrinsic column widths (scrollable block);
+    # flow tables stretch to 100% of the available label width.
+    attrs = [] if natural else ['width="100%"']
+    attrs += ['border="1"', 'cellspacing="0"', 'cellpadding="6"']
     border = _MARKDOWN_COLORS.get("border")
     if border:
         attrs.append(f'bordercolor="{border}"')
@@ -869,7 +930,7 @@ def _table_html(header, aligns, rows) -> str:
     return "".join(parts)
 
 
-def markdown_to_html(text: str) -> str:
+def markdown_to_html(text: str, natural_tables: bool = False) -> str:
     text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     out = []
@@ -901,7 +962,7 @@ def markdown_to_html(text: str) -> str:
         nonlocal table
         if table is not None:
             header, aligns, rows = table
-            out.append(_table_html(header, aligns, rows))
+            out.append(_table_html(header, aligns, rows, natural=natural_tables))
             table = None
 
     def flush_all():
@@ -929,13 +990,12 @@ def markdown_to_html(text: str) -> str:
             i += 1
             continue
         # GFM table: header row followed by a |---|---| separator row.
-        if (table is None and stripped.startswith("|")
-                and i + 1 < len(lines) and _is_table_separator(lines[i + 1])):
+        started = _table_start(lines, i) if table is None else None
+        if started is not None:
             flush_para()
             flush_list()
             flush_quote()
-            header = _split_table_row(stripped)
-            aligns = [_table_alignment(c) for c in _split_table_row(lines[i + 1])]
+            header, aligns = started
             table = (header, aligns, [])
             i += 2
             continue
@@ -983,6 +1043,79 @@ def markdown_to_html(text: str) -> str:
 # Widgets
 # ---------------------------------------------------------------------------
 
+class _TableBlock(QScrollArea):
+    """A markdown table rendered adaptively inside its own scroll area.
+
+    A table that fits the available width stretches to fill it; a wider one
+    keeps its natural column widths and gets a horizontal scrollbar. Height
+    is capped so a long table never takes over the chat.
+    """
+
+    MAX_HEIGHT = 320  # px cap so a long table never fills the whole chat
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("table_scroll")
+        self._md = None
+        self._html = ""
+        self.label = QLabel()
+        self.label.setTextFormat(Qt.RichText)
+        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.label.setContextMenuPolicy(Qt.NoContextMenu)
+        self.setWidget(self.label)
+        self.setWidgetResizable(False)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_markdown(self, md: str, force: bool = False):
+        if md == self._md and not force:
+            return
+        self._md = md
+        self._render()
+
+    def _render(self):
+        """Re-layout the table for the current block width.
+
+        Decisions use the frame width (not the viewport) so scrollbar
+        visibility cannot feed back into the layout choice.
+        """
+        if self._md is None:
+            return
+        doc = QTextDocument()
+        natural_html = markdown_to_html(self._md, natural_tables=True)
+        doc.setHtml(natural_html)
+        natural_w = math.ceil(doc.idealWidth()) + 2
+
+        available = max(120, self.width() - 4)
+        if natural_w <= available:
+            # Adaptive: the table fits — stretch it across the full width.
+            self._html = markdown_to_html(self._md)
+            doc.setHtml(self._html)
+            doc.setTextWidth(available)
+            width = available
+            height = math.ceil(doc.size().height()) + 2
+        else:
+            # Wider than the bubble: natural columns + horizontal scrolling.
+            self._html = natural_html
+            doc.setTextWidth(natural_w)
+            width = natural_w
+            height = math.ceil(doc.size().height()) + 2
+        self.label.setText(self._html)
+        self.label.setFixedSize(width, height)
+        hbar = self.horizontalScrollBar().sizeHint().height() + 2
+        self.setFixedHeight(min(height + hbar, self.MAX_HEIGHT))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render()
+
+    def rerender(self):
+        """Re-render with the current markdown (theme colors changed)."""
+        if self._md is not None:
+            self._render()
+
+
 class Bubble(QFrame):
     """Rounded chat bubble. sender in ('user', 'assistant', 'error').
 
@@ -1006,13 +1139,8 @@ class Bubble(QFrame):
         lay.setContentsMargins(12, 9, 12, 9)
         lay.setSpacing(6)
         self.image_label = None
-        self.label = QLabel()
-        self.label.setObjectName(f"bubble_{sender}")
-        self.label.setWordWrap(True)
-        self.label.setTextFormat(Qt.RichText)
-        self.label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        # Route right-clicks on the text to the bubble's own context menu.
-        self.label.setContextMenuPolicy(Qt.NoContextMenu)
+        self._block_widgets = []  # markdown blocks rendered after self.label
+        self.label = self._make_text_label()
         lay.addWidget(self.label)
         self._text = ""
 
@@ -1046,13 +1174,57 @@ class Bubble(QFrame):
         elif delete_act is not None and chosen is delete_act:
             self.actionRequested.emit("delete")
 
-    def set_text(self, text: str):
+    def _make_text_label(self) -> QLabel:
+        label = QLabel()
+        label.setObjectName(f"bubble_{self.sender}")
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.RichText)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        label.setContextMenuPolicy(Qt.NoContextMenu)
+        return label
+
+    def set_text(self, text: str, force: bool = False):
+        """Render markdown; tables become standalone scrollable blocks."""
         self._text = text
-        self.label.setText(markdown_to_html(text))
+        blocks = split_markdown_blocks(text)
+        first_md = blocks[0][1] if blocks and blocks[0][0] == "text" else ""
+        rest = blocks[1:] if blocks and blocks[0][0] == "text" else blocks
+        self.label.setText(markdown_to_html(first_md))
+        self._sync_blocks(rest, force=force)
+
+    def _sync_blocks(self, rest, force: bool = False):
+        lay = self.layout()
+        insert_at = 2 if self.image_label is not None else 1  # after self.label
+        widgets = self._block_widgets
+        while len(widgets) > len(rest):
+            stale = widgets.pop()
+            stale.setParent(None)
+            stale.deleteLater()
+        for i, (kind, md) in enumerate(rest):
+            widget = widgets[i] if i < len(widgets) else None
+            kind_ok = (isinstance(widget, _TableBlock) if kind == "table"
+                       else isinstance(widget, QLabel))
+            if widget is not None and not kind_ok:
+                widget.setParent(None)
+                widget.deleteLater()
+                widget = None
+            if widget is None:
+                widget = (_TableBlock() if kind == "table"
+                          else self._make_text_label())
+                lay.insertWidget(insert_at + i, widget)
+                if i < len(widgets):
+                    widgets[i] = widget
+                else:
+                    widgets.append(widget)
+            if kind == "table":
+                widget.set_markdown(md, force=force)
+            else:
+                widget.setText(markdown_to_html(md))
 
     def set_html(self, html_text: str):
         self._text = ""
         self.label.setText(html_text)
+        self._sync_blocks([])
 
     def set_image(self, pixmap: QPixmap):
         if self.image_label is None:

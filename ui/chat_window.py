@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
@@ -52,6 +53,8 @@ from config import (
     DEFAULT_MODEL,
     DEFAULT_STT_SILENCE_TIMEOUT,
     DEFAULT_VISION_MODEL,
+    DEFAULT_WEBSEARCH_MAX_QUERIES,
+    DEFAULT_WEBSEARCH_MULTI_SEARCH,
     DEFAULT_WEBSEARCH_PROVIDER,
     DEFAULT_WEBSEARCH_URL,
     DEFAULT_WINDOW_HEIGHT,
@@ -91,17 +94,34 @@ SEARCH_DECISION_SYSTEM = (
     "You are a search-decision engine for a chat assistant. "
     "Decide whether answering the user's question requires up-to-date information "
     "from the web. Reply with ONLY a JSON object:\n"
-    '{"needs_search": true/false, "query": "<concise search query in the user\'s language>"}\n'
+    '{"needs_search": true/false, "queries": ["<search query 1>", "<search query 2>"]}\n'
     "Set needs_search to true when the question is about: recent news, current prices, "
     "latest software versions, documentation, current events, time-sensitive information, "
     "a specific website, company facts, or fresh technical data.\n"
+    "When needs_search is true, split the question into DISTINCT search queries that "
+    "together cover everything needed (different products, aspects, dates or names). "
+    "Use at most {max_queries} queries; a single query is fine when one search suffices.\n"
     "Set needs_search to false for stable general-knowledge or coding questions "
     "that do not depend on current facts (e.g. \"What is Python?\", "
     "\"How does a for loop work?\", \"Write a sorting function\").\n"
     "Do not output anything except the JSON object."
 )
 
+
+def _search_decision_system(max_queries: int) -> str:
+    """Decision prompt with the configured query budget baked in.
+
+    ``str.format`` is not usable here — the text contains literal JSON braces.
+    """
+    return SEARCH_DECISION_SYSTEM.replace(
+        "{max_queries}", str(max(1, int(max_queries))))
+
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
+
+# Streaming UI throttle: chunks accumulate in a buffer and the bubble is
+# re-rendered at most once per this interval (ms). Visually instant, but
+# keeps the GUI thread free from per-chunk full markdown re-renders.
+STREAM_FLUSH_MS = 50
 
 # Native edge-resize via WM_NCHITTEST (frameless window).
 WM_NCHITTEST = 0x0084
@@ -112,20 +132,48 @@ RESIZE_MARGIN = 8  # px from the window border that starts an edge resize
 
 
 def _parse_search_decision(reply: str):
-    """Parse the DeepSeek search-decision JSON. Defaults to searching on failure."""
+    """Parse the DeepSeek search-decision JSON into (needs_search, queries).
+
+    Accepts the multi-query format ("queries": [...]) and the legacy single
+    "query" key. Defaults to searching on failure.
+    """
     text = (reply or "").strip()
     start = text.find("{")
     end = text.rfind("}")
     needs_search = True
-    query = ""
+    queries = []
     if start != -1 and end > start:
         try:
             obj = json.loads(text[start:end + 1])
             needs_search = bool(obj.get("needs_search", True))
-            query = (obj.get("query") or "").strip()
+            raw_queries = obj.get("queries")
+            if isinstance(raw_queries, str):
+                raw_queries = [raw_queries]
+            if isinstance(raw_queries, list):
+                queries = [str(q).strip() for q in raw_queries
+                           if str(q).strip()]
+            if not queries:
+                legacy = (obj.get("query") or "").strip()
+                if legacy:
+                    queries = [legacy]
         except Exception:
             pass
-    return needs_search, query
+    return needs_search, queries
+
+
+def _dedupe_queries(queries: list, limit: int) -> list:
+    """Drop duplicate queries (case-insensitive), capped at ``limit``."""
+    seen = set()
+    out = []
+    for query in queries:
+        key = query.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(query)
+        if len(out) >= limit:
+            break
+    return out
 
 
 class _ChatTab(QWidget):
@@ -139,6 +187,11 @@ class _ChatTab(QWidget):
         self._assistant_bubble = None
         self._thinking = None
         self._thinking_container = None
+        # Streaming buffer: chunks accumulate here and are rendered on a
+        # timer instead of re-rendering the whole bubble for every chunk.
+        self._pending_stream_text = ""
+        self._stream_text = ""  # full text of the answer being streamed
+        self._stream_timer = None
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         self.scroll = QScrollArea()
@@ -204,6 +257,9 @@ class ChatWindow(QWidget):
             Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("AI Quick Chat")
+        # Files can be dragged straight onto the chat window; the window
+        # itself receives the drop (see dragEnterEvent/dropEvent).
+        self.setAcceptDrops(True)
         # Hard size bounds — nothing (animations, edge resize, config) can
         # push the window outside these limits.
         self.setMinimumSize(WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT)
@@ -325,6 +381,9 @@ class ChatWindow(QWidget):
         self.input.setObjectName("input")
         self.input.setPlaceholderText(t("chat.input_placeholder"))
         self.input.setAcceptRichText(False)
+        # Drops are handled by the window: without this the input would
+        # swallow file drags as plain text.
+        self.input.setAcceptDrops(False)
         self.input.setMinimumHeight(40)
         self.input.setMaximumHeight(120)
         self.input.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -409,7 +468,9 @@ class ChatWindow(QWidget):
                 continue
             for bubble, _entry in tab.links:
                 if bubble.text():
-                    bubble.set_text(bubble.text())
+                    # force=True re-renders cached table blocks with the
+                    # fresh theme colors (set_markdown_colors above).
+                    bubble.set_text(bubble.text(), force=True)
 
     def _apply_icon_colors(self):
         """Recolour all Tabler icons to match the active theme."""
@@ -532,7 +593,7 @@ class ChatWindow(QWidget):
         colors = theme_colors(self.config.get("appearance", "theme", "dark"))
         close_button = colors.get("close_button", "#FF5C5C")
         white = colors.get("user_message_text", "#FFFFFF")
-        close_btn = IconButton("x", tooltip=t("chat.close_tab_tooltip"), size=11,
+        close_btn = IconButton("x", tooltip=t("chat.close_tab_tooltip"), size=12,
                                color=close_button)
         close_btn.setObjectName("tab_close_btn")
         close_btn.setFixedSize(18, 18)
@@ -709,12 +770,12 @@ class ChatWindow(QWidget):
             animate_fade_in(widget, 190)
         self._scroll_to_bottom(tab)
 
-    def _scroll_to_bottom(self, tab=None):
+    def _scroll_to_bottom(self, tab=None, animate=True):
         tab = tab or self._current_tab()
         if tab is None:
             return
         bar = tab.scroll.verticalScrollBar()
-        if self._animations_enabled():
+        if animate and self._animations_enabled():
             QTimer.singleShot(0, lambda: smooth_scroll(bar, bar.maximum()))
         else:
             QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
@@ -738,16 +799,24 @@ class ChatWindow(QWidget):
             lambda action, b=bubble: self._on_bubble_action(b, action))
 
     def _edit_allowed(self, bubble) -> bool:
-        """Editing is only offered for the last user message of an idle tab."""
+        """Editing is offered for the tab's LAST user message, even after
+        the AI has already replied to it (editing removes the stale reply
+        and re-asks)."""
         tab = getattr(bubble, "tab", None)
         if tab is None or self._tab_busy(tab):
             return False
-        if not tab.links or tab.links[-1][0] is not bubble:
+        link = next((ln for ln in tab.links if ln[0] is bubble), None)
+        if link is None:
             return False
-        entry = tab.links[-1][1]
-        return (entry.get("role") == "user"
-                and not entry.get("_image")
-                and not entry.get("_files"))
+        entry = link[1]
+        if entry.get("role") != "user" or entry.get("_image"):
+            return False
+        # Everything after this message must be assistant replies —
+        # otherwise a newer user message exists and editing this one
+        # would rewrite the middle of the conversation.
+        index = tab.links.index(link)
+        return all(ln[1].get("role") == "assistant"
+                   for ln in tab.links[index + 1:])
 
     def _add_user_bubble(self, text: str, has_image: bool = False,
                          pixmap: QPixmap = None, name: str = "", tab=None):
@@ -815,23 +884,79 @@ class ChatWindow(QWidget):
             self._save_history()
         elif action == "edit" and self._edit_allowed(bubble):
             current = entry.get("content", "")
-            new_text = self._edit_message_dialog(current)
-            if new_text is None:
+            result = self._edit_message_dialog(current)
+            if result is None:
                 return
-            new_text = new_text.strip()
-            if not new_text or new_text == current:
+            new_text, docs, image = result
+            new_text = (new_text or "").strip()
+            docs = docs or []
+            if (not new_text and not docs and image is None):
                 return
-            entry["content"] = new_text
-            bubble.set_text(new_text)
+            if (new_text == current and not docs and image is None
+                    and "_files" not in entry):
+                return  # nothing changed
+            full_text = self._compose_docs_message(new_text, docs)
+            display = self._docs_display_text(new_text, docs)
+            if image is not None:
+                image_obj, image_name = image
+                parts = []
+                if full_text:
+                    parts.append({"type": "text", "text": full_text})
+                parts.append({
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_uri(image_obj)},
+                })
+                entry["content"] = parts
+                entry["_image"] = True
+                if docs:
+                    entry["_files"] = [name for name, _ in docs]
+                    entry["_display"] = display
+                else:
+                    entry.pop("_files", None)
+                    entry.pop("_display", None)
+                pixmap = QPixmap.fromImage(image_obj)
+                bubble.set_image(self._scaled_bubble_pixmap(pixmap))
+                if display or new_text:
+                    bubble.set_text(display or new_text)
+                else:
+                    muted = theme_colors(
+                        self.config.get("appearance", "theme", "dark"))["muted"]
+                    photo = inline_icon_img("photo", muted, 15, 1.6)
+                    label = html.escape(image_name) if image_name \
+                        else t("chat.image_name")
+                    bubble.set_html(
+                        f'<span style="opacity:0.85;">{photo} {label}</span>')
+                self._drop_following_assistant_replies(tab, link)
+                self._save_history()
+                if self._vision_enabled():
+                    tab._pending_vision_bubble = bubble
+                    self._start_vision_task(tab, image_obj, full_text,
+                                            image_name)
+                else:
+                    self._start_text_task(tab, new_text or display,
+                                          web_search=self._web_search_enabled())
+                return
+            entry["content"] = full_text
+            if docs:
+                entry["_files"] = [name for name, _ in docs]
+                entry["_display"] = display
+            else:
+                entry.pop("_files", None)
+                entry.pop("_display", None)
+            bubble.set_text(display if docs else new_text)
             # Drop the stale AI reply that followed, if any.
-            index = tab.links.index(link)
-            if (index + 1 < len(tab.links)
-                    and tab.links[index + 1][1].get("role") == "assistant"):
-                self._remove_linked_message(tab, tab.links[index + 1])
+            self._drop_following_assistant_replies(tab, link)
             self._save_history()
             # Ask the AI to answer the edited message.
-            self._start_text_task(tab, new_text,
+            self._start_text_task(tab, new_text or display,
                                   web_search=self._web_search_enabled())
+
+    def _drop_following_assistant_replies(self, tab, link):
+        """Remove every assistant reply that follows the given user link."""
+        index = tab.links.index(link)
+        while (index + 1 < len(tab.links)
+               and tab.links[index + 1][1].get("role") == "assistant"):
+            self._remove_linked_message(tab, tab.links[index + 1])
 
     def _remove_linked_message(self, tab, link):
         bubble, entry = link
@@ -846,7 +971,12 @@ class ChatWindow(QWidget):
             bubble.deleteLater()
 
     def _edit_message_dialog(self, text: str):
-        """Modal editor for a sent user message. Returns new text or None."""
+        """Modal editor for a sent user message.
+
+        Returns ``(new_text, docs, image)`` where docs is ``[(name, text)]``
+        and image is ``(QImage, name)`` or None — or None when cancelled.
+        Attachments work like in the normal composer.
+        """
         dialog = QDialog(self)
         dialog.setWindowTitle(t("chat.edit_title"))
         dialog.setModal(True)
@@ -858,6 +988,107 @@ class ChatWindow(QWidget):
         editor.setPlainText(text)
         editor.setMinimumSize(380, 150)
         lay.addWidget(editor)
+
+        # Attachment row (hidden until something is attached).
+        chips_row = QWidget()
+        chips_lay = QHBoxLayout(chips_row)
+        chips_lay.setContentsMargins(0, 0, 0, 0)
+        chips_lay.setSpacing(6)
+        chips_row.hide()
+        lay.addWidget(chips_row)
+
+        docs = []          # [(name, text)]
+        image_holder = {}  # {"image": QImage, "name": str} when attached
+
+        def _make_chip(icon_name, label_text):
+            colors = theme_colors(self.config.get("appearance", "theme", "dark"))
+            chip = QFrame()
+            chip.setObjectName("doc_chip")
+            chip_lay = QHBoxLayout(chip)
+            chip_lay.setContentsMargins(9, 3, 5, 3)
+            chip_lay.setSpacing(6)
+            icon_label = QLabel()
+            icon_label.setPixmap(
+                create_icon(icon_name, 13, colors["muted"], 1.6).pixmap(13, 13))
+            chip_lay.addWidget(icon_label)
+            name_label = QLabel(label_text)
+            name_label.setToolTip(label_text)
+            chip_lay.addWidget(name_label)
+            return chip, chip_lay
+
+        def refresh_chips():
+            while chips_lay.count():
+                item = chips_lay.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            for index, (name, _doc_text) in enumerate(docs):
+                chip, chip_lay = _make_chip("file-text", name)
+                remove_btn = IconButton(
+                    "x", tooltip=t("chat.remove_doc_tooltip"), size=10)
+                remove_btn.setFixedSize(16, 16)
+                remove_btn.clicked.connect(
+                    lambda checked=False, i=index: (docs.pop(i),
+                                                    refresh_chips()))
+                chip_lay.addWidget(remove_btn)
+                chips_lay.addWidget(chip)
+            if image_holder:
+                label = image_holder["name"] or t("chat.image_name")
+                chip, chip_lay = _make_chip("photo", label)
+                remove_btn = IconButton(
+                    "x", tooltip=t("chat.remove_image_tooltip"), size=10)
+                remove_btn.setFixedSize(16, 16)
+                remove_btn.clicked.connect(_remove_image)
+                chip_lay.addWidget(remove_btn)
+                chips_lay.addWidget(chip)
+            chips_lay.addStretch(1)
+            chips_row.setVisible(bool(docs) or bool(image_holder))
+
+        def _remove_image():
+            image_holder.clear()
+            refresh_chips()
+
+        def pick_file():
+            path, _ = QFileDialog.getOpenFileName(
+                dialog, t("chat.attach_dialog_title"), "",
+                t("chat.filter_images") + ";;" + t("chat.filter_text")
+                + ";;" + t("chat.filter_all"))
+            if not path:
+                return
+            suffix = Path(path).suffix.lower()
+            if suffix in IMAGE_EXTENSIONS:
+                pixmap = QPixmap(path)
+                if pixmap.isNull():
+                    QMessageBox.warning(dialog, t("chat.edit_title"),
+                                        t("chat.error_image_load"))
+                    return
+                image_holder["image"] = pixmap.toImage()
+                image_holder["name"] = Path(path).name
+            elif suffix in DOC_EXTENSIONS:
+                try:
+                    doc_text, _truncated = read_document(path)
+                except DocumentError as e:
+                    QMessageBox.warning(dialog, t("chat.edit_title"),
+                                        t(e.key, **e.kwargs))
+                    return
+                docs.append((Path(path).name, doc_text))
+            else:
+                QMessageBox.warning(dialog, t("chat.edit_title"),
+                                    t("chat.file_unsupported"))
+            refresh_chips()
+
+        attach_row = QHBoxLayout()
+        attach_btn = QPushButton(t("chat.attach_tooltip"))
+        attach_btn.setObjectName("ghost")
+        attach_btn.setIcon(create_icon(
+            "paperclip", 14,
+            theme_colors(self.config.get("appearance", "theme", "dark"))["muted"],
+            1.6))
+        attach_btn.clicked.connect(pick_file)
+        attach_row.addWidget(attach_btn)
+        attach_row.addStretch(1)
+        lay.addLayout(attach_row)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel_btn = QPushButton(t("common.cancel"))
@@ -870,7 +1101,9 @@ class ChatWindow(QWidget):
         buttons.addWidget(save_btn)
         lay.addLayout(buttons)
         if dialog.exec() == QDialog.Accepted:
-            return editor.toPlainText()
+            image = ((image_holder["image"], image_holder["name"])
+                     if image_holder else None)
+            return editor.toPlainText(), list(docs), image
         return None
 
     def _show_thinking(self, text: str = None, tab=None):
@@ -966,20 +1199,28 @@ class ChatWindow(QWidget):
         path, _ = QFileDialog.getOpenFileName(
             self, t("chat.attach_dialog_title"), "",
             t("chat.filter_images") + ";;" + t("chat.filter_text") + ";;" + t("chat.filter_all"))
-        if not path:
-            return
+        if path:
+            self._ingest_local_file(path)
+
+    def _ingest_local_file(self, path: str) -> bool:
+        """Route one picked/dropped file into the composer.
+
+        Returns True when the file type is handled (attached, or reported
+        as an error), False for unsupported types.
+        """
         suffix = Path(path).suffix.lower()
         if suffix in IMAGE_EXTENSIONS:
             pixmap = QPixmap(path)
             if pixmap.isNull():
                 self._show_error_bubble(t("chat.error_image_load"),
                                         f"File: {path}")
-                return
+                return True
             self._set_pending_image(pixmap.toImage(), Path(path).name)
-        elif suffix in DOC_EXTENSIONS:
+            return True
+        if suffix in DOC_EXTENSIONS:
             self._attach_document(path)
-        else:
-            self._show_info_bubble(t("chat.file_unsupported"))
+            return True
+        return False
 
     def _attach_document(self, path: str):
         """Read a document's text and pin it as a chip above the composer."""
@@ -1414,6 +1655,16 @@ class ChatWindow(QWidget):
             timeout=int(self.config.get("web_search", "timeout", 15) or 15),
         )
 
+    def _max_search_queries(self) -> int:
+        """Configured per-question query budget for multi-search (1..5)."""
+        try:
+            value = int(self.config.get(
+                "web_search", "max_queries",
+                DEFAULT_WEBSEARCH_MAX_QUERIES) or 1)
+        except (TypeError, ValueError):
+            value = DEFAULT_WEBSEARCH_MAX_QUERIES
+        return max(1, min(5, value))
+
     def _show_web_banner(self, text: str):
         self.web_banner_text.setText(text)
         self.web_banner.show()
@@ -1466,7 +1717,8 @@ class ChatWindow(QWidget):
 
             # Step 1 — DeepSeek decides whether fresh web data is needed.
             decision_messages = [
-                {"role": "system", "content": SEARCH_DECISION_SYSTEM},
+                {"role": "system", "content": _search_decision_system(
+                    self._max_search_queries())},
                 {"role": "user", "content": question},
             ]
             try:
@@ -1479,7 +1731,7 @@ class ChatWindow(QWidget):
             if cancelled():
                 yield ("cancelled",)
                 return
-            needs_search, query = _parse_search_decision(decision)
+            needs_search, queries = _parse_search_decision(decision)
 
             if not needs_search:
                 yield ("status", t("chat.thinking_no_search"))
@@ -1487,18 +1739,45 @@ class ChatWindow(QWidget):
                     yield item
                 return
 
-            # Step 2 — real web search.
-            yield ("status", t("chat.thinking_searching"))
-            yield ("webstatus", t("chat.web_searching"))
-            try:
-                results = self._make_websearch().search(query or question)
-            except APIError as e:
-                yield ("info", t("chat.search_failed", msg=e.message))
+            # Multi-search: up to N distinct queries per question; the
+            # feature can be disabled to keep the old single-query flow.
+            max_queries = self._max_search_queries()
+            if not bool(self.config.get(
+                    "web_search", "multi_search",
+                    DEFAULT_WEBSEARCH_MULTI_SEARCH)):
+                max_queries = 1
+            queries = _dedupe_queries(queries, max_queries)
+            if not queries:
+                queries = [question]
+
+            # Step 2 — real web searches, one per query, results aggregated.
+            websearch = self._make_websearch()
+            results = []
+            used_queries = []
+            failed = 0
+            total = len(queries)
+            for i, query in enumerate(queries, 1):
+                yield ("status", t("chat.thinking_searching"))
+                yield ("webstatus", t(
+                    "chat.web_searching_n", i=i, n=total, query=query))
+                try:
+                    found = websearch.search(query)
+                except APIError as e:
+                    failed += 1
+                    yield ("info", t("chat.search_failed", msg=e.message))
+                    continue
+                if cancelled():
+                    yield ("cancelled",)
+                    return
+                if found:
+                    known_urls = {r.url for r in results}
+                    results.extend(
+                        r for r in found if r.url not in known_urls)
+                    used_queries.append(query)
+            if failed >= total and total > 0:
+                # Every query failed — answer from the model's own knowledge.
                 for item in stream(messages):
                     yield item
-                return
-            if cancelled():
-                yield ("cancelled",)
                 return
 
             if not results:
@@ -1508,9 +1787,9 @@ class ChatWindow(QWidget):
                 yield ("sources", results)
                 yield ("webstatus", t("chat.web_found", count=len(results)))
 
-            # Step 3 — DeepSeek answers using the search context.
+            # Step 3 — DeepSeek answers using the aggregated search context.
             yield ("status", t("chat.thinking_answer"))
-            context = build_search_context(query or question, results)
+            context = build_search_context(used_queries or queries, results)
             enriched = messages + [{"role": "user", "content": context}]
             for item in stream(enriched):
                 yield item
@@ -1632,18 +1911,52 @@ class ChatWindow(QWidget):
         if task is None:
             return
         tab = task.tab
+        # Accumulate instead of rendering immediately: dozens of chunks per
+        # second collapse into at most one bubble re-render per flush tick.
+        tab._pending_stream_text += chunk
+        self._schedule_stream_flush(tab)
+
+    def _schedule_stream_flush(self, tab):
+        """Render buffered stream text at most once per STREAM_FLUSH_MS."""
+        timer = tab._stream_timer
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda t=tab: self._flush_stream(t))
+            tab._stream_timer = timer
+        if not timer.isActive():
+            timer.start(STREAM_FLUSH_MS)
+
+    def _reset_stream_buffer(self, tab):
+        """Drop pending stream text and stop its flush timer (task finished)."""
+        tab._pending_stream_text = ""
+        tab._stream_text = ""
+        if tab._stream_timer is not None:
+            tab._stream_timer.stop()
+
+    def _flush_stream(self, tab):
+        """Render everything streamed so far into the assistant bubble."""
+        buffered = tab._pending_stream_text
+        if not buffered:
+            return
+        tab._pending_stream_text = ""
+        # The bubble is fully re-rendered on each flush, so it must always
+        # receive the WHOLE answer text, not just the newest chunk tail.
+        tab._stream_text += buffered
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is None:
             tab._assistant_bubble = self._add_assistant_bubble("", streaming=True, tab=tab)
-        tab._assistant_bubble.set_text(tab._assistant_bubble.text() + chunk)
-        self._scroll_to_bottom(tab)
+        tab._assistant_bubble.set_text(tab._stream_text)
+        self._scroll_to_bottom(tab, animate=False)
 
     def _on_done(self, task_id: int, full_text: str):
         task = self._tasks.get(task_id)
         if task is None:
             return
         tab = task.tab
+        # Render any still-buffered chunks so the bubble matches full_text.
+        self._flush_stream(tab)
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is not None:
@@ -1675,6 +1988,8 @@ class ChatWindow(QWidget):
         if task is None:
             return
         tab = task.tab
+        # Flush buffered chunks so the kept partial answer loses nothing.
+        self._flush_stream(tab)
         if tab._thinking is not None:
             self._hide_thinking(tab)
         if tab._assistant_bubble is not None:
@@ -1710,6 +2025,9 @@ class ChatWindow(QWidget):
         task = self._tasks.pop(task_id, None)
         if task is None:
             return
+        # No pending flush may fire after the task is finalized (it could
+        # otherwise recreate a bubble or overwrite an error/empty message).
+        self._reset_stream_buffer(task.tab)
         if task.watchdog is not None:
             task.watchdog.stop()
             task.watchdog = None
@@ -1749,6 +2067,42 @@ class ChatWindow(QWidget):
                 if self._handle_clipboard_paste():
                     return True
         return super().eventFilter(obj, event)
+
+    # ------------------------------------------------------------ drag & drop
+
+    def _accepts_drag(self, event) -> bool:
+        md = event.mimeData()
+        return bool(md.hasUrls() or md.hasImage())
+
+    def dragEnterEvent(self, event):
+        if self._accepts_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._accepts_drag(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        md = event.mimeData()
+        # A bare image (e.g. dragged from a browser) with no file behind it.
+        if not md.hasUrls() and md.hasImage():
+            image = md.imageData()
+            if image is not None and not image.isNull():
+                self._set_pending_image(image, "")
+                event.acceptProposedAction()
+                return
+        unsupported = []
+        for url in md.urls():
+            path = url.toLocalFile()
+            if path and not self._ingest_local_file(path):
+                unsupported.append(Path(path).name)
+        if unsupported:
+            self._show_info_bubble(t("chat.file_unsupported"))
+        event.acceptProposedAction()
 
     def _on_close_clicked(self):
         # Always hide to tray; the app keeps running in the background.
@@ -1866,6 +2220,9 @@ class ChatWindow(QWidget):
         anim.setStartValue(start_geo)
         anim.setEndValue(end_geo)
         anim.setEasingCurve(QEasingCurve.OutCubic)
+        # The last animation tick lands while the animation still reports
+        # Running, so resizeEvent skips it — settle widths on finish.
+        anim.finished.connect(self._refresh_bubble_widths)
         self._geo_anim = anim
         self._geo_anim_lock = True
         try:
@@ -1876,6 +2233,17 @@ class ChatWindow(QWidget):
         finally:
             self._geo_anim_lock = False
 
+    def _refresh_bubble_widths(self):
+        """Re-fit bubbles (and their adaptive tables) to the window width."""
+        max_width = self._bubble_max_width()
+        for i in range(self.tabs_widget.count()):
+            tab = self.tabs_widget.widget(i)
+            if not isinstance(tab, _ChatTab):
+                continue
+            for bubble, _entry in tab.links:
+                if bubble.maximumWidth() != max_width:
+                    bubble.setMaximumWidth(max_width)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if not self._geo_anim_active():
@@ -1885,6 +2253,7 @@ class ChatWindow(QWidget):
             # it only reaches disk on the next regular config save.
             self.config.set_window("width", geo.width())
             self.config.set_window("height", geo.height())
+            self._refresh_bubble_widths()
 
     def moveEvent(self, event):
         super().moveEvent(event)

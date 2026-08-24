@@ -53,14 +53,17 @@ def test_delete_ai_message(chat_window):
     assert [e["role"] for e in tab.conversation] == ["user"]
 
 
-def test_edit_allowed_only_for_last_user_message(chat_window):
+def test_edit_allowed_for_last_user_message_even_with_reply(chat_window):
     tab = _tab(chat_window)
     u1 = _add(chat_window, tab, "user", "q1")
     assert chat_window._edit_allowed(u1)
-    _add(chat_window, tab, "assistant", "a1")
-    assert not chat_window._edit_allowed(u1)  # reply arrived
+    ai1 = _add(chat_window, tab, "assistant", "a1")
+    # The AI already replied — the user may still edit their last message.
+    assert chat_window._edit_allowed(u1)
+    assert not chat_window._edit_allowed(ai1)  # AI replies are not editable
     u2 = _add(chat_window, tab, "user", "q2")
     assert chat_window._edit_allowed(u2)
+    assert not chat_window._edit_allowed(u1)  # newer user message exists
     assert not chat_window._edit_allowed(_add(
         chat_window, tab, "user", "vision", _image=True))
 
@@ -85,7 +88,7 @@ def test_edit_updates_text_and_resends_to_ai(chat_window, monkeypatch):
         chat_window, "_start_text_task",
         lambda tab_arg, text, web_search=False: sent.append((id(tab_arg), text)))
     monkeypatch.setattr(chat_window, "_edit_message_dialog",
-                        lambda text: "edited question")
+                        lambda text: ("edited question", [], None))
     chat_window._on_bubble_action(last, "edit")
     assert last.text() == "edited question"
     assert tab.conversation[-1]["content"] == "edited question"
@@ -103,10 +106,60 @@ def test_edit_of_last_with_reply_removes_it_and_resends(chat_window, monkeypatch
         chat_window, "_start_text_task",
         lambda tab_arg, text, web_search=False: sent.append(text))
     monkeypatch.setattr(chat_window, "_edit_message_dialog",
-                        lambda text: "v2")
+                        lambda text: ("v2", [], None))
     chat_window._on_bubble_action(new_last, "edit")
     assert [e["content"] for e in tab.conversation] == ["q", "old", "v2"]
     assert sent == ["v2"]
+
+
+def test_edit_with_reply_replaces_stale_ai_answer(chat_window, monkeypatch):
+    """Editing the last user message after the AI replied must delete that
+    reply and re-ask the AI on the edited message."""
+    tab = _tab(chat_window)
+    user = _add(chat_window, tab, "user", "draft q")
+    _add(chat_window, tab, "assistant", "stale answer")
+
+    sent = []
+    monkeypatch.setattr(
+        chat_window, "_start_text_task",
+        lambda tab_arg, text, web_search=False: sent.append((tab_arg, text)))
+    monkeypatch.setattr(chat_window, "_edit_message_dialog",
+                        lambda text: ("complete q", [], None))
+    chat_window._on_bubble_action(user, "edit")
+    # The stale answer is gone; the edited question is the last entry.
+    assert [e["role"] for e in tab.conversation] == ["user"]
+    assert tab.conversation[-1]["content"] == "complete q"
+    assert sent == [(tab, "complete q")]
+
+
+def test_edit_with_attached_doc_sends_full_content(chat_window, monkeypatch):
+    tab = _tab(chat_window)
+    last = _add(chat_window, tab, "user", "last q")
+
+    sent = []
+    monkeypatch.setattr(
+        chat_window, "_start_text_task",
+        lambda tab_arg, text, web_search=False: sent.append(text))
+    monkeypatch.setattr(chat_window, "_edit_message_dialog",
+                        lambda text: ("edited q", [("a.txt", "file body")], None))
+    chat_window._on_bubble_action(last, "edit")
+    entry = tab.conversation[-1]
+    assert entry["_files"] == ["a.txt"]
+    assert entry["_display"] == chat_window._docs_display_text(
+        "edited q", [("a.txt", "file body")])
+    # Content carries the full message with the file snippet appended.
+    assert entry["content"].startswith("edited q\n")
+    assert "file body" in entry["content"]
+    # The model is asked about the edited text (not the display variant).
+    assert sent == ["edited q"]
+
+
+def test_ingest_local_file_routes_files(chat_window, tmp_path):
+    doc = tmp_path / "note.txt"
+    doc.write_text("hello world", encoding="utf-8")
+    assert chat_window._ingest_local_file(str(doc)) is True
+    assert chat_window.pending_docs and chat_window.pending_docs[-1][0] == "note.txt"
+    assert chat_window._ingest_local_file(str(tmp_path / "blob.bin")) is False
 
 
 def test_memory_injected_into_system_prompt(chat_window):

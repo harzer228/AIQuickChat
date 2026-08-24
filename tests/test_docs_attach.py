@@ -89,7 +89,9 @@ def test_history_saves_short_display_for_docs(chat_window, monkeypatch, tmp_path
     assert "notes.txt" in display_text
 
 
-def test_docs_message_not_editable(chat_window, monkeypatch, tmp_path):
+def test_docs_message_editable(chat_window, monkeypatch, tmp_path):
+    """Messages with attached docs are now editable (files can be swapped
+    while editing, like in the normal composer)."""
     chat = chat_window
     monkeypatch.setattr(chat, "_start_text_task",
                         lambda tab_arg, text, web_search=False: None)
@@ -97,4 +99,4 @@ def test_docs_message_not_editable(chat_window, monkeypatch, tmp_path):
     chat.input.setPlainText("вопрос")
     chat.send_current()
     bubble = chat._current_tab().links[-1][0]
-    assert not chat._edit_allowed(bubble)
+    assert chat._edit_allowed(bubble)
