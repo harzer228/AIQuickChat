@@ -1868,6 +1868,9 @@ class ChatWindow(QWidget):
         anim.setStartValue(start_geo)
         anim.setEndValue(end_geo)
         anim.setEasingCurve(QEasingCurve.OutCubic)
+        # The last animation tick lands while the animation still reports
+        # Running, so resizeEvent skips it — settle widths on finish.
+        anim.finished.connect(self._refresh_bubble_widths)
         self._geo_anim = anim
         self._geo_anim_lock = True
         try:
@@ -1878,6 +1881,17 @@ class ChatWindow(QWidget):
         finally:
             self._geo_anim_lock = False
 
+    def _refresh_bubble_widths(self):
+        """Re-fit bubbles (and their adaptive tables) to the window width."""
+        max_width = self._bubble_max_width()
+        for i in range(self.tabs_widget.count()):
+            tab = self.tabs_widget.widget(i)
+            if not isinstance(tab, _ChatTab):
+                continue
+            for bubble, _entry in tab.links:
+                if bubble.maximumWidth() != max_width:
+                    bubble.setMaximumWidth(max_width)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if not self._geo_anim_active():
@@ -1887,6 +1901,7 @@ class ChatWindow(QWidget):
             # it only reaches disk on the next regular config save.
             self.config.set_window("width", geo.width())
             self.config.set_window("height", geo.height())
+            self._refresh_bubble_widths()
 
     def moveEvent(self, event):
         super().moveEvent(event)

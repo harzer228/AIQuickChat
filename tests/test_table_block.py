@@ -1,6 +1,9 @@
-"""Scrollable table blocks: splitter, natural sizing, cap, theme refresh."""
+"""Scrollable table blocks: splitter, adaptive sizing, cap, theme refresh."""
 
-from PySide6.QtCore import Qt
+import math
+
+from PySide6.QtCore import QEventLoop, Qt, QTimer
+from PySide6.QtGui import QTextDocument
 from PySide6.QtWidgets import QLabel
 
 from ui.widgets import (
@@ -10,6 +13,13 @@ from ui.widgets import (
     set_markdown_colors,
     split_markdown_blocks,
 )
+
+
+def _natural_width(md: str) -> int:
+    """The width markdown_to_html(natural_tables=True) needs for ``md``."""
+    doc = QTextDocument()
+    doc.setHtml(markdown_to_html(md, natural_tables=True))
+    return math.ceil(doc.idealWidth()) + 2
 
 TABLE_MD = "| Имя | Возраст |\n|-----|---------|\n| Аня | 30 |\n| Боря | 40 |"
 
@@ -61,6 +71,7 @@ def test_bubble_renders_single_table_block(qapp):
     tables = bubble.findChildren(_TableBlock)
     assert len(tables) == 1
     assert "Аня" in tables[0]._html
+    assert "<th>Имя</th>" in tables[0].label.text()  # actually displayed
     assert bubble.text() == "вот таблица:\n" + TABLE_MD  # copy source intact
 
 
@@ -91,6 +102,80 @@ def test_tall_table_height_capped(qapp):
     assert block.maximumHeight() <= _TableBlock.MAX_HEIGHT
     assert block.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
     assert block.verticalScrollBarPolicy() == Qt.ScrollBarAsNeeded
+
+
+WIDE_TABLE_MD = (
+    "| колонка-один | колонка-два | колонка-три | колонка-четыре |\n"
+    "|---------------|--------------|-------------|----------------|\n"
+    "| " + "оченьдлинноеслово " * 6 + "| значение | значение | значение |")
+
+
+def test_fit_mode_stretches_full_width(qapp):
+    block = _TableBlock()
+    block.resize(_natural_width(TABLE_MD) + 120, 100)
+    block.set_markdown(TABLE_MD)
+    # The table fits the available width — adaptive flow render takes over.
+    assert 'width="100%"' in block._html
+
+
+def test_overflow_falls_back_to_natural_columns(qapp):
+    block = _TableBlock()
+    block.resize(max(140, _natural_width(WIDE_TABLE_MD) - 100), 100)
+    block.set_markdown(WIDE_TABLE_MD)
+    assert 'width="100%"' not in block._html
+
+
+def test_render_puts_html_into_label_both_modes(qapp):
+    # Fit mode (wide block, small table).
+    fit = _TableBlock()
+    fit.resize(_natural_width(TABLE_MD) + 120, 100)
+    fit.set_markdown(TABLE_MD)
+    assert "<th>" in fit.label.text()
+
+    # Overflow mode (narrow block, wide table).
+    overflow = _TableBlock()
+    overflow.resize(max(140, _natural_width(WIDE_TABLE_MD) - 100), 100)
+    overflow.set_markdown(WIDE_TABLE_MD)
+    assert "<th>" in overflow.label.text()
+
+
+def test_resize_switches_render_mode(qapp):
+    natural_w = _natural_width(TABLE_MD)
+    narrow = max(120, natural_w - 60)
+    wide = natural_w + 150
+    block = _TableBlock()
+    block.show()  # hidden widgets do not get resizeEvent on resize()
+
+    block.resize(narrow, 100)
+    block.set_markdown(TABLE_MD)
+    natural_first = 'width="100%"' not in block._html
+
+    block.resize(wide, 100)  # resizeEvent re-renders for the new width
+    fitted_after = 'width="100%"' in block._html
+
+    block.resize(narrow, 100)
+    natural_again = 'width="100%"' not in block._html
+    assert natural_first and fitted_after and natural_again
+
+
+def test_window_resize_updates_bubble_width(chat_window):
+    chat = chat_window
+    chat.config.set("appearance", "animations", False)
+    tab = chat._current_tab()
+    bubble = chat._add_assistant_bubble("с таблицей", tab=tab)
+    entry = {"role": "assistant", "content": "с таблицей"}
+    tab.conversation.append(entry)
+    chat._link_bubble(tab, bubble, entry)  # _refresh_bubble_widths walks links
+    assert bubble.maximumWidth() < 700  # created for the default window
+
+    chat.resize(900, 700)
+    loop = QEventLoop()
+    QTimer.singleShot(60, loop.quit)
+    loop.exec()
+
+    # resizeEvent re-fits every linked bubble to the new _bubble_max_width().
+    assert bubble.maximumWidth() == chat._bubble_max_width()
+    assert bubble.maximumWidth() >= 700
 
 
 def test_streaming_growth_keeps_one_block(qapp):

@@ -1036,10 +1036,11 @@ def markdown_to_html(text: str, natural_tables: bool = False) -> str:
 # ---------------------------------------------------------------------------
 
 class _TableBlock(QScrollArea):
-    """A markdown table rendered at natural size inside its own scroll area.
+    """A markdown table rendered adaptively inside its own scroll area.
 
-    Wide tables get a horizontal scrollbar, long tables are capped in height
-    and scroll vertically — neither can overflow or take over the chat.
+    A table that fits the available width stretches to fill it; a wider one
+    keeps its natural column widths and gets a horizontal scrollbar. Height
+    is capped so a long table never takes over the chat.
     """
 
     MAX_HEIGHT = 320  # px cap so a long table never fills the whole chat
@@ -1063,23 +1064,48 @@ class _TableBlock(QScrollArea):
         if md == self._md and not force:
             return
         self._md = md
-        self._html = markdown_to_html(md, natural_tables=True)
-        self.label.setText(self._html)
-        # Natural content size via QTextDocument (QLabel sizeHint is
-        # unreliable for wide rich-text tables).
+        self._render()
+
+    def _render(self):
+        """Re-layout the table for the current block width.
+
+        Decisions use the frame width (not the viewport) so scrollbar
+        visibility cannot feed back into the layout choice.
+        """
+        if self._md is None:
+            return
         doc = QTextDocument()
-        doc.setHtml(self._html)
-        width = math.ceil(doc.idealWidth()) + 2
-        doc.setTextWidth(width)
-        height = math.ceil(doc.size().height()) + 2
+        natural_html = markdown_to_html(self._md, natural_tables=True)
+        doc.setHtml(natural_html)
+        natural_w = math.ceil(doc.idealWidth()) + 2
+
+        available = max(120, self.width() - 4)
+        if natural_w <= available:
+            # Adaptive: the table fits — stretch it across the full width.
+            self._html = markdown_to_html(self._md)
+            doc.setHtml(self._html)
+            doc.setTextWidth(available)
+            width = available
+            height = math.ceil(doc.size().height()) + 2
+        else:
+            # Wider than the bubble: natural columns + horizontal scrolling.
+            self._html = natural_html
+            doc.setTextWidth(natural_w)
+            width = natural_w
+            height = math.ceil(doc.size().height()) + 2
+        self.label.setText(self._html)
         self.label.setFixedSize(width, height)
         hbar = self.horizontalScrollBar().sizeHint().height() + 2
         self.setFixedHeight(min(height + hbar, self.MAX_HEIGHT))
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._render()
+
     def rerender(self):
         """Re-render with the current markdown (theme colors changed)."""
         if self._md is not None:
-            self.set_markdown(self._md, force=True)
+            self._render()
 
 
 class Bubble(QFrame):
