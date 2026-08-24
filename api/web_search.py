@@ -388,9 +388,24 @@ class WebSearchClient:
         return t("search.connected")
 
 
-def build_search_context(query: str, results: list[SearchResult]) -> str:
-    """Build the structured context block passed to DeepSeek."""
-    lines = ["WEB SEARCH RESULTS", "", "Query:", (query or "").strip(), ""]
+def build_search_context(query, results: list[SearchResult]) -> str:
+    """Build the structured context block passed to DeepSeek.
+
+    ``query`` is either a single query string or the list of executed
+    queries (multi-search).
+    """
+    if isinstance(query, (list, tuple)):
+        queries = [str(q).strip() for q in query if str(q).strip()]
+    else:
+        queries = [(query or "").strip()]
+    queries = queries or [""]
+    lines = ["WEB SEARCH RESULTS", ""]
+    if len(queries) == 1:
+        lines += ["Query:", queries[0], ""]
+    else:
+        lines.append("Queries:")
+        lines.extend(f"{i}. {q}" for i, q in enumerate(queries, 1))
+        lines.append("")
     if not results:
         lines.append("No sources found.")
     else:

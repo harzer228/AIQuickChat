@@ -40,7 +40,9 @@ from config import (
     DEFAULT_STT_HOTKEY,
     DEFAULT_STT_SILENCE_TIMEOUT,
     DEFAULT_VISION_MODEL,
+    DEFAULT_WEBSEARCH_MAX_QUERIES,
     DEFAULT_WEBSEARCH_MAX_RESULTS,
+    DEFAULT_WEBSEARCH_MULTI_SEARCH,
     DEFAULT_WEBSEARCH_PROVIDER,
     DEFAULT_WEBSEARCH_TIMEOUT,
     DEFAULT_WEBSEARCH_URL,
@@ -474,6 +476,21 @@ class SettingsWindow(QWidget):
         results_row.addWidget(self.ws_max_results)
         results_row.addStretch(1)
         ws_lay.addLayout(results_row)
+        multi_row = QHBoxLayout()
+        multi_row.setSpacing(8)
+        self.ws_multi_check = QCheckBox()
+        self._text_entries.append((self.ws_multi_check, "settings.multi_search"))
+        multi_row.addWidget(self.ws_multi_check)
+        multi_row.addWidget(self._field_label("settings.max_queries"), 0)
+        self.ws_max_queries = QSpinBox()
+        self.ws_max_queries.setRange(1, 5)
+        self.ws_max_queries.setValue(DEFAULT_WEBSEARCH_MAX_QUERIES)
+        multi_row.addWidget(self.ws_max_queries)
+        multi_row.addStretch(1)
+        # The query budget only matters when multi-search is on.
+        self.ws_multi_check.toggled.connect(self.ws_max_queries.setEnabled)
+        self.ws_max_queries.setEnabled(DEFAULT_WEBSEARCH_MULTI_SEARCH)
+        ws_lay.addLayout(multi_row)
         timeout_row = QHBoxLayout()
         timeout_row.setSpacing(8)
         timeout_row.addWidget(self._field_label("settings.search_timeout"), 0)
@@ -740,6 +757,14 @@ class SettingsWindow(QWidget):
         self.ws_key.setText(cfg.get_websearch_key())
         self.ws_max_results.setValue(int(cfg.get("web_search", "max_results", 5) or 5))
         self.ws_timeout.setValue(int(cfg.get("web_search", "timeout", 15) or 15))
+        self.ws_multi_check.setChecked(bool(cfg.get(
+            "web_search", "multi_search", DEFAULT_WEBSEARCH_MULTI_SEARCH)))
+        try:
+            max_queries = int(cfg.get(
+                "web_search", "max_queries", DEFAULT_WEBSEARCH_MAX_QUERIES) or 1)
+        except (TypeError, ValueError):
+            max_queries = DEFAULT_WEBSEARCH_MAX_QUERIES
+        self.ws_max_queries.setValue(max(1, min(5, max_queries)))
 
         self.stt_enable_check.setChecked(bool(cfg.get_stt("enabled", False)))
         self._refresh_mic_list(select=cfg.get_stt("microphone", ""))
@@ -813,6 +838,9 @@ class SettingsWindow(QWidget):
         cfg.set_websearch_key(self.ws_key.text().strip())
         cfg.set("web_search", "max_results", self.ws_max_results.value())
         cfg.set("web_search", "timeout", self.ws_timeout.value())
+        cfg.set("web_search", "multi_search",
+                self.ws_multi_check.isChecked())
+        cfg.set("web_search", "max_queries", self.ws_max_queries.value())
 
         cfg.set_stt("enabled", self.stt_enable_check.isChecked())
         cfg.set_stt("microphone", self.stt_mic_combo.currentData() or "")

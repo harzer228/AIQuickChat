@@ -14,6 +14,9 @@ DEFAULT_WEBSEARCH_PROVIDER = "tavily"
 DEFAULT_WEBSEARCH_URL = "https://api.tavily.com/search"
 DEFAULT_WEBSEARCH_MAX_RESULTS = 5
 DEFAULT_WEBSEARCH_TIMEOUT = 15
+# Multi-search: let the model run several distinct queries per question.
+DEFAULT_WEBSEARCH_MULTI_SEARCH = True
+DEFAULT_WEBSEARCH_MAX_QUERIES = 3
 
 # Speech-to-Text (local Vosk) defaults
 DEFAULT_STT_SILENCE_TIMEOUT = 1.5
@@ -83,6 +86,8 @@ DEFAULT_CONFIG = {
         "api_url": DEFAULT_WEBSEARCH_URL,
         "max_results": DEFAULT_WEBSEARCH_MAX_RESULTS,
         "timeout": DEFAULT_WEBSEARCH_TIMEOUT,
+        "multi_search": DEFAULT_WEBSEARCH_MULTI_SEARCH,
+        "max_queries": DEFAULT_WEBSEARCH_MAX_QUERIES,
     },
     "hotkey": "Ctrl+Space",
     "stt_hotkey": DEFAULT_STT_HOTKEY,

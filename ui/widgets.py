@@ -702,8 +702,16 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
 QScrollBar:horizontal {{ background: transparent; height: 6px; margin: 2px; }}
 QScrollBar::handle:horizontal {{ background: {c['scroll']}; border-radius: 3px; min-width: 30px; }}
+QScrollBar::handle:horizontal:hover {{ background: {c['text_secondary']}; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal {{ background: transparent; }}
+
+/* Table blocks: chunkier scrollbars that are easier to grab. Hover glow
+   is inherited from the global rules above. */
+QScrollArea#table_scroll QScrollBar:vertical {{ width: 10px; margin: 1px; }}
+QScrollArea#table_scroll QScrollBar::handle:vertical {{ border-radius: 4px; min-height: 24px; }}
+QScrollArea#table_scroll QScrollBar:horizontal {{ height: 10px; margin: 1px; }}
+QScrollArea#table_scroll QScrollBar::handle:horizontal {{ border-radius: 4px; min-width: 24px; }}
 
 QTabWidget::pane {{ border: none; background: transparent; }}
 QTabBar {{ background: transparent; qproperty-drawBase: 0; }}
