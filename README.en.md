@@ -50,22 +50,30 @@ leaves your machine).
   field. Automatic silence stop (1.5 s by default), microphone selection, Vosk
   model path and on/off switch are configured in Settings.
 - **Frameless window**: translucent, rounded, always on top.
-- **Streaming answers** — text appears progressively; during generation the
-  send button turns into a real **Stop** button that actually cancels the
-  request while keeping the partial text.
+- **Streaming answers** — text appears progressively and **without freezing the
+  window**: incoming chunks are buffered and the rendering is refreshed in
+  fixed portions, so the UI stays responsive even with long answers. During
+  generation the send button turns into a real **Stop** button that actually
+  cancels the request while keeping the partial text.
 - **Web Search**: a toggle in the chat searches the web for up-to-date
   information, feeds the cleaned context to DeepSeek and shows clickable
   sources in the answer. Providers: Tavily / SearXNG / Serper / Brave **and
   "Local (no API)"** — a keyless local engine (`local_websearch/` module,
-  DuckDuckGo → SearXNG → Wikipedia cascade + full-text page fetching).
+  DuckDuckGo → SearXNG → Wikipedia cascade + full-text page fetching). The AI
+  can split a question into **multiple distinct search queries** (multi-search)
+  and merge the sources; multi-search can be toggled and capped (1–5 queries)
+  in Settings.
 - **AI Memory**: store personal info or your own prompt in Settings — the
   assistant considers it in every reply (toggleable with a checkbox).
 - **Message context menu** (right-click): Copy (a working button), Edit your
-  last message (the AI re-answers the edited version), Delete your own message
-  (the AI reply is kept) or an AI reply.
-- **Paste images** via `Ctrl+V` or the attach button (PNG/JPG/JPEG/WEBP/BMP)
-  with a preview and a remove button. Sent pictures are shown in the chat as
-  thumbnails.
+  last message — available even after the AI has already replied: the stale
+  reply is removed and the AI re-answers the edited version (files can be
+  attached while editing, just like in the normal composer); Delete your own
+  message (the AI reply is kept) or an AI reply.
+- **Paste images** via `Ctrl+V`, the attach button or by **dragging them
+  straight onto the chat window** (PNG/JPG/JPEG/WEBP/BMP) with a preview and a
+  remove button; text files/documents can be dropped too. Sent pictures are
+  shown in the chat as thumbnails.
 - **Vision pipeline**: image → Cloudflare Vision
   (`@cf/meta/llama-3.2-11b-vision-instruct`) → description → DeepSeek →
   answer. DeepSeek never receives the image itself. The Meta model license is
@@ -201,6 +209,9 @@ In **Settings** → **Web Search**:
 - **Search API Key** — stored in the Windows Credential Manager like the other
   keys.
 - **Maximum results** (1–20) and **Search timeout** (5–120 s).
+- **Multiple search queries** + **Max queries** (1–5) — multi-search: the AI
+  splits the question into several distinct search queries, runs them one by
+  one and merges the found sources (URL duplicates are removed).
 - The **Test Connection** button performs a real minimal request and shows
   `✓ Connected successfully` or the actual error reason. The secret key is
   never shown in full — only as `API key: tvly-****abcd`.
@@ -228,10 +239,10 @@ How a search-enabled request flows:
 User
   ↓
 DeepSeek decides whether fresh information is needed
+  ↓ (if yes — up to N distinct queries, multi-search)
+Web Search (a real HTTP search per query)
   ↓
-Web Search (a real HTTP search)
-  ↓
-Clean results → structured context
+Clean results → deduplication → structured context
   ↓
 DeepSeek → answer
   ↓
