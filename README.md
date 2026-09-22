@@ -12,7 +12,7 @@
 Cloudflare Vision. Умеет **диктовать сообщения голосом локально** (Speech-to-Text
 на Vosk, без отправки аудио в интернет).
 
-<img width="454" height="566" alt="изображение" src="https://github.com/user-attachments/assets/1004b134-7638-45ba-ad44-8660127a3b40" /> <img width="449" height="708" alt="изображение" src="https://github.com/user-attachments/assets/7a9920c8-39a6-40ad-ba93-b28ce1c6254e" />
+<img width="454" height="566" alt="изображение" src="https://github.com/user-attachments/assets/1004b134-7638-45ba-ad44-8660127a3b40"
 
 
 
