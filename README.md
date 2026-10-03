@@ -2,7 +2,7 @@
 
 **[🇷🇺 Русский](README.md)** | **[🇬🇧 English](README.en.md)**
 
-[![CI](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml/badge.svg)]
+[![CI](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml/badge.svg)](https://github.com/harzer228/AIQuickChat/actions/workflows/ci.yml)
 
 Быстрый **desktop AI-ассистент для Windows**. Вызывается глобальной горячей
 клавишей (`Ctrl+Space` по умолчанию) поверх любого приложения — браузера,
